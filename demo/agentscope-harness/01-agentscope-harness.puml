@@ -1,0 +1,59 @@
+@startuml
+hide footbox
+skinparam shadowing false
+skinparam roundcorner 8
+skinparam ArrowColor #505050
+title AgentScope Harness: Multi-turn Session
+
+legend top left
+|= Color |= Module |
+|<#FFF2CC>| User business logic |
+|<#D9EAD3>| common contracts / session |
+|<#CFE2F3>| harness lifecycle |
+|<#FCE5CD>| AgentScope framework |
+|<#EAD1DC>| External LLM serving |
+endlegend
+
+box "User business logic (demo/agentscope-harness/demo.py)" #FFF2CC
+participant "main()\nbusiness assembly" as App #FFF2CC
+end box
+box "common" #D9EAD3
+participant "AgentRequest\nHarnessSpec\nSharedSession" as Contract #D9EAD3
+participant "InMemorySessionProvider" as Sessions #D9EAD3
+participant "StaticContextProvider" as Context #D9EAD3
+end box
+box "harness" #CFE2F3
+participant "ProviderHarness" as Harness #CFE2F3
+participant "AgentScopeRuntimeAdapter" as Adapter #CFE2F3
+end box
+box "AgentScope framework" #FCE5CD
+participant "OpenAIChatModel\nAgentScope Agent" as AgentScope #FCE5CD
+end box
+participant "OpenAI-compatible\nLLM Serving" as LLM #EAD1DC
+
+App -> Contract: Build HarnessSpec / AgentRequest
+App -> Harness: ProviderHarness(spec, providers, adapter)
+App -> Harness: validate()
+Harness -> Adapter: capabilities()
+Adapter --> Harness: Declared Capability set
+
+loop Each turn (same session_id)
+  App -> Harness: run(AgentRequest)
+  Harness -> Sessions: load(session_id)
+  Sessions --> Harness: SharedSession
+  Harness -> Harness: Build contract.* ContextItems
+  Harness -> Context: provide(request, session)
+  Context --> Harness: conversation-policy ContextItem
+  Harness -> Adapter: build(spec, providers) [first run]
+  Adapter -> AgentScope: Build native agent [first run]
+  AgentScope --> Adapter: RunningAgent
+  Harness -> Adapter: RunningAgent.run(context)
+  Adapter -> AgentScope: reply(prompt + context_items)
+  AgentScope -> LLM: chat completion
+  LLM --> AgentScope: model reply
+  AgentScope --> Adapter: native response
+  Adapter --> Harness: AgentResult(completed, output)
+  Harness -> Sessions: save(messages + run_id)
+  Harness --> App: AgentResult
+end
+@enduml

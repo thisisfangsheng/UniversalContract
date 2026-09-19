@@ -1,0 +1,67 @@
+@startuml
+hide footbox
+skinparam shadowing false
+skinparam roundcorner 8
+skinparam ArrowColor #505050
+title AgentScope Harness: AMap MCP Multi-turn Query
+
+legend top left
+|= Color |= Module |
+|<#FFF2CC>| User business logic |
+|<#D9EAD3>| common contracts / session |
+|<#CFE2F3>| harness lifecycle |
+|<#FCE5CD>| AgentScope framework and MCP Toolkit |
+|<#EAD1DC>| External LLM / MCP services |
+endlegend
+
+box "User business logic (demo/agentscope-harness-mcp/demo.py)" #FFF2CC
+participant "main()\nbusiness assembly" as App #FFF2CC
+end box
+box "common" #D9EAD3
+participant "HarnessSpec\nMcpServerSpec\nAgentRequest" as Contract #D9EAD3
+participant "InMemorySessionProvider" as Sessions #D9EAD3
+participant "StaticContextProvider" as Context #D9EAD3
+end box
+box "harness" #CFE2F3
+participant "ProviderHarness" as Harness #CFE2F3
+participant "AgentScopeMcpRuntimeAdapter" as Adapter #CFE2F3
+end box
+box "AgentScope framework" #FCE5CD
+participant "OpenAIChatModel\nAgentScope Agent" as AgentScope #FCE5CD
+participant "MCPClient -> Toolkit" as Toolkit #FCE5CD
+end box
+participant "OpenAI-compatible\nLLM Serving" as LLM #EAD1DC
+participant "AMap\nStreamable HTTP MCP" as AMap #EAD1DC
+
+App -> Contract: Declare McpServerSpec(amap)\nallowed_tools allowlist
+App -> Harness: ProviderHarness(spec, providers, adapter)
+App -> Harness: validate()
+Harness -> Adapter: capabilities()
+Adapter --> Harness: TOOL_LOOP supported
+
+loop POI / route / nearby restaurant turns
+  App -> Harness: run(AgentRequest)
+  Harness -> Sessions: load(session_id)
+  Sessions --> Harness: SharedSession
+  Harness -> Context: provide(request, session)
+  Context --> Harness: map evidence policy
+  Harness -> Adapter: build(spec, providers) [first run]
+  Adapter -> Toolkit: MCPClient(config=amap) [first run]
+  Toolkit -> AMap: connect and discover allowed tools [first run]
+  AMap --> Toolkit: geo / transit / around-search tools
+  Adapter -> AgentScope: Build native Agent + Toolkit [first run]
+  Harness -> Adapter: RunningAgent.run(context)
+  Adapter -> AgentScope: reply(context_items)
+  AgentScope -> LLM: request next step
+  LLM --> AgentScope: tool call
+  AgentScope -> Toolkit: call allowed map tool
+  Toolkit -> AMap: Streamable HTTP MCP request
+  AMap --> Toolkit: real-time map result
+  Toolkit --> AgentScope: tool result
+  AgentScope -> LLM: continue with tool evidence
+  LLM --> AgentScope: final answer
+  Adapter --> Harness: AgentResult(completed)
+  Harness -> Sessions: save(neutral session + run_id)
+  Harness --> App: output answer
+end
+@enduml

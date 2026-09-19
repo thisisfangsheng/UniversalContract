@@ -1,0 +1,85 @@
+@startuml
+hide footbox
+skinparam shadowing false
+skinparam roundcorner 8
+skinparam ArrowColor #505050
+title AgentScope and LangGraph: Shared Harness Session and Runtime Exchange
+
+legend top left
+|= Color |= Module |
+|<#FFF2CC>| User business logic |
+|<#D9EAD3>| common contracts / shared session |
+|<#CFE2F3>| harness lifecycle and adapters |
+|<#FCE5CD>| AgentScope / LangGraph frameworks |
+|<#EAD1DC>| External LLM / AMap MCP |
+endlegend
+
+box "User business logic (demo/agent-exchange-mcp/demo.py)" #FFF2CC
+participant "main() / run_turn()" as App #FFF2CC
+end box
+box "common" #D9EAD3
+participant "HarnessSpec\nAgentRequest\nContextItem" as Contract #D9EAD3
+participant "InMemorySessionProvider\nsole SharedSession owner" as Sessions #D9EAD3
+participant "StaticContextProvider" as Context #D9EAD3
+end box
+box "harness" #CFE2F3
+participant "AgentScope\nProviderHarness" as ASHarness #CFE2F3
+participant "LangGraph\nProviderHarness" as LGHarness #CFE2F3
+participant "AgentScopeMcpRuntimeAdapter" as ASAdapter #CFE2F3
+participant "LangGraphMcpRuntimeAdapter" as LGAdapter #CFE2F3
+end box
+box "Specific frameworks" #FCE5CD
+participant "AgentScope Agent\nMCP Toolkit" as AS #FCE5CD
+participant "LangGraph ReAct Agent\nMultiServerMCPClient" as LG #FCE5CD
+end box
+participant "OpenAI-compatible\nLLM Serving" as LLM #EAD1DC
+participant "AMap MCP" as AMap #EAD1DC
+
+App -> Contract: Create one shared HarnessSpec\nwith McpServerSpec(amap)
+App -> ASHarness: ProviderHarness(spec, sessions, ASAdapter)
+App -> LGHarness: ProviderHarness(spec, sessions, LGAdapter)
+
+== Turns 1-2: AgentScope ==
+loop Each AgentScope turn
+  App -> ASHarness: run(AgentRequest, same session_id)
+  ASHarness -> Sessions: load(session_id)
+  Sessions --> ASHarness: SharedSession (all previous messages)
+  ASHarness -> Context: provide()
+  Context --> ASHarness: AMap policy
+  ASHarness -> ASAdapter: run(context_items)
+  ASAdapter -> AS: native Agent + MCP Toolkit
+  AS -> LLM: chat / tool decision
+  AS -> AMap: MCP tool call when needed
+  AMap --> AS: map result
+  AS --> ASAdapter: final answer
+  ASAdapter --> ASHarness: AgentResult
+  ASHarness -> Sessions: save(user / assistant messages)
+end
+
+== Turns 3-4: Exchange to LangGraph ==
+loop Each LangGraph turn
+  App -> LGHarness: run(AgentRequest, same session_id)
+  LGHarness -> Sessions: load(session_id)
+  Sessions --> LGHarness: same SharedSession (includes AgentScope history)
+  LGHarness -> Context: provide()
+  LGHarness -> LGAdapter: run(context_items)
+  LGAdapter -> LG: LangGraph ReAct Agent
+  LG -> LLM: chat / tool decision
+  LG -> AMap: MCP tool call when needed
+  AMap --> LG: map result
+  LG --> LGAdapter: final answer
+  LGAdapter --> LGHarness: AgentResult
+  LGHarness -> Sessions: save(neutral message history)
+end
+
+== Turn 5: Return to AgentScope ==
+App -> ASHarness: run(same session_id)
+ASHarness -> Sessions: load(session_id)
+Sessions --> ASHarness: history written by both frameworks
+ASHarness -> ASAdapter: run(context_items)
+ASAdapter -> AS: read contract.session.messages
+AS -> LLM: summarize prior conversation
+LLM --> AS: final answer
+ASAdapter --> ASHarness: AgentResult
+ASHarness -> Sessions: save()
+@enduml

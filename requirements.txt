@@ -1,0 +1,13 @@
+# UniversalContract 完整示例与离线测试的运行依赖。
+# Python >= 3.11；版本区间以 digitalemployee 环境中的验证组合为基线。
+agent-framework>=1.17,<2.0
+agentscope>=2.0,<3.0
+typing-extensions>=4.12
+openai>=1.0,<3.0
+mcp>=1.24,<2.0
+langgraph>=1.0,<2.0
+langchain-openai>=1.0,<2.0
+langchain-mcp-adapters>=0.2,<1.0
+fastapi>=0.110,<1.0
+httpx>=0.27,<1.0
+PyYAML>=6.0,<7.0

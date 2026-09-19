@@ -1,0 +1,40 @@
+id: shanghai-trip
+session_id: react-two-agent-trip-session
+goal: 看看上海有什么好玩的，以及之后一周天气如何，选一个天气好的日子，查一下当天单程北京到上海的航班信息。
+facts:
+  origin: 北京
+  destination: 上海
+  trip_type: 单程
+
+context:
+  label: evidence-policy
+  content: >
+    请用中文回答。实时 POI、天气和航班信息必须来自本 worker 可用 MCP 工具。
+    前序 worker 结果仅可作为下一次查询的输入事实；没有工具证据时必须明确说明无法确认。
+  priority: 10
+
+workers:
+  - worker_id: agentscope-amap-trip-worker
+    template: amap-trip
+    endpoint_path: /workers/agentscope-amap-trip-worker/tasks
+    mcp:
+      endpoint_env: AMAP_MCP_ENDPOINT
+      allowed_tools:
+        - maps_text_search
+        - maps_weather
+      request_timeout_s: 30
+
+  - worker_id: langgraph-maqami-flight-worker
+    template: maqami-flight
+    endpoint_path: /workers/langgraph-maqami-flight-worker/tasks
+    mcp:
+      url: https://mcp.maqami.co/
+      allowed_tools:
+        - post_flights_rates
+      request_timeout_s: 60
+
+orchestration:
+  engine: magentic
+  max_round_count: 2
+  max_stall_count: 1
+  max_reset_count: 0

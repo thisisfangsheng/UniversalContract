@@ -1,0 +1,103 @@
+@startuml
+hide footbox
+skinparam shadowing false
+skinparam roundcorner 8
+skinparam ArrowColor #505050
+title Magentic REACT: AgentScope AMap Worker and LangGraph Maqami Worker
+
+legend top left
+|= Color |= Module |
+|<#FFF2CC>| User business logic |
+|<#D9EAD3>| common contracts, A2A, collaboration snapshot |
+|<#CFE2F3>| harness lifecycle and framework adapters |
+|<#D9D2E9>| orchestration / Magentic control plane |
+|<#FCE5CD>| AgentScope / LangGraph / MAF framework |
+|<#EAD1DC>| External LLM / MCP services |
+endlegend
+
+box "User business logic (demo/react-orchestration-2-agent/demo.py)" #FFF2CC
+participant "main()\nassemble two Workers" as App #FFF2CC
+participant "InMemorySessions\nEvidenceOnlyContext" as Business #FFF2CC
+end box
+box "orchestration" #D9D2E9
+participant "create_react_workflow" as Factory #D9D2E9
+participant "DeterministicMagenticManager" as Manager #D9D2E9
+participant "MagenticWorkerAdapter" as MagAdapter #D9D2E9
+end box
+box "MAF framework" #FCE5CD
+participant "MagenticBuilder\nMagentic workflow" as Magentic #FCE5CD
+end box
+box "common" #D9EAD3
+participant "WorkerDescriptor\nWorkerTask / WorkerResult" as Contract #D9EAD3
+participant "A2AWorkerEndpoint" as Endpoint #D9EAD3
+participant "A2AWorkerService" as Service #D9EAD3
+end box
+box "harness" #CFE2F3
+participant "Map ProviderHarness\nAgentScopeMcpRuntimeAdapter" as MapHarness #CFE2F3
+participant "Flight ProviderHarness\nLangGraphMcpRuntimeAdapter" as FlightHarness #CFE2F3
+end box
+box "Specific frameworks" #FCE5CD
+participant "AgentScope Map Agent" as MapAgent #FCE5CD
+participant "LangGraph Flight Agent" as FlightAgent #FCE5CD
+end box
+participant "OpenAI-compatible\nLLM Serving" as LLM #EAD1DC
+participant "AMap MCP" as AMap #EAD1DC
+participant "Maqami Flight MCP" as Maqami #EAD1DC
+
+App -> Contract: Create two WorkerDescriptor cards\n(amap-poi-weather / maqami-flight-rates)
+App -> Factory: create_react_workflow(endpoints, manager)
+Factory -> MagAdapter: Wrap each WorkerEndpoint as participant adapter
+Factory -> Magentic: MagenticBuilder(participants, manager).build()
+App -> Magentic: run(goal, stream=True)
+Magentic -> Manager: plan / progress ledger
+Manager --> Magentic: Select map-weather worker first
+
+== Round 1: Map and weather ==
+Magentic -> MagAdapter: handle_instruction(map task)
+MagAdapter -> Contract: Create WorkerTask + collaboration snapshot
+MagAdapter -> Endpoint: execute(task, session_id)
+Endpoint -> Service: A2A payload
+Service -> MapHarness: run(AgentRequest + collaboration)
+MapHarness -> Business: load(session) / provide(evidence policy)
+MapHarness -> MapAgent: AgentScope adapter runs
+MapAgent -> LLM: tool planning
+LLM --> MapAgent: maps_text_search / maps_weather call
+MapAgent -> AMap: MCP request
+AMap --> MapAgent: Shanghai POI and weather evidence
+MapAgent -> LLM: create recommended date from evidence
+LLM --> MapAgent: final map-weather answer
+MapAgent --> MapHarness: AgentResult
+MapHarness -> Business: save(SharedSession)
+MapHarness --> Service: AgentResult
+Service --> Endpoint: WorkerResult
+Endpoint --> MagAdapter: WorkerResult
+MagAdapter --> Magentic: participant response
+Magentic -> Manager: replan / progress ledger
+Manager --> Magentic: Select flight worker using prior date
+
+== Round 2: Flight rates ==
+Magentic -> MagAdapter: handle_instruction(flight task)
+MagAdapter -> Contract: WorkerTask + prior_results snapshot
+MagAdapter -> Endpoint: execute(task, session_id)
+Endpoint -> Service: A2A payload
+Service -> FlightHarness: run(AgentRequest + collaboration)
+FlightHarness -> Business: load(session) / provide(evidence policy)
+FlightHarness -> FlightAgent: LangGraph adapter runs
+FlightAgent -> LLM: identify selected date from context
+LLM --> FlightAgent: post_flights_rates call
+FlightAgent -> Maqami: MCP flight-rate request (BJS -> SHA)
+Maqami --> FlightAgent: flights, prices, baggage evidence
+FlightAgent -> LLM: create answer from tool result
+LLM --> FlightAgent: final flight answer
+FlightAgent --> FlightHarness: AgentResult
+FlightHarness -> Business: save(SharedSession)
+FlightHarness --> Service: AgentResult
+Service --> Endpoint: WorkerResult
+Endpoint --> MagAdapter: WorkerResult
+MagAdapter --> Magentic: participant response
+Magentic -> Manager: final progress ledger
+Manager --> Magentic: Goal satisfied; aggregate
+Magentic --> App: final response
+App -> Factory: finalize(request, final response)
+Factory --> App: OrchestrationResult(worker_results, rounds)
+@enduml
