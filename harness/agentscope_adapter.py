@@ -96,9 +96,10 @@ class AgentScopeRuntimeAdapter:
         spec: HarnessSpec,
         providers: HarnessProviders,
     ) -> RunningAgent:
-        # 不支持的声明必须显式报错，避免调用者误以为 MCP/Skill 已被加载。
-        if spec.tools or spec.skills:
-            raise ValueError("AgentScopeRuntimeAdapter 基础实现尚未翻译 MCP 或 Skill 声明。")
+        # MCP tools 仍需要 MCP 专用适配器；Skill 内容则由 ProviderHarness
+        # 以统一 ContextItem 降级注入，不依赖 MCP 连接。
+        if spec.tools:
+            raise ValueError("AgentScopeRuntimeAdapter 基础实现尚未翻译 MCP 声明。")
 
         # 用唯一的中立 spec 字段构造 AgentScope 原生 agent。
         agent = Agent(

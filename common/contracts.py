@@ -39,6 +39,7 @@ class Capability(StrEnum):
     HUMAN_APPROVAL = "human_approval"                # 支持人工审批暂停/恢复
     BACKGROUND_AGENTS = "background_agents"          # 支持后台异步运行子智能体
     STRUCTURED_OUTPUT = "structured_output"          # 能产出结构化结果（AgentResult.data）
+    SKILLS = "skills"                                # 支持按需加载 Skill 全文
 
 
 class McpTransport(StrEnum):
@@ -303,6 +304,9 @@ class HarnessProviders:
 
     session: SessionProvider                         # 会话存取（必填）
     contexts: Sequence[ContextProvider] = ()         # 上下文生产者（可多个，按优先级合并）
+    skills: SkillRegistry | None = None              # Skill 注册表；None 保持旧行为
+    skill_script_policy: SkillScriptPolicy | None = None  # 默认由 Harness 拒绝技能脚本
+    strict_skills: bool = False                      # True 时将被拒绝的脚本声明视为阻断问题
 
 
 @dataclass(frozen=True)

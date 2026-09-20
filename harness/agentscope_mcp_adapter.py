@@ -155,8 +155,6 @@ class AgentScopeMcpRuntimeAdapter:
         providers: HarnessProviders,
     ) -> RunningAgent:
         """将 MCP 声明转换为 Toolkit，再创建具备原生工具循环的 Agent。"""
-        if spec.skills:
-            raise ValueError("AgentScopeMcpRuntimeAdapter 尚未翻译 Skill 声明。")
         serving = spec.llm_serving or self._default_serving
         if serving is None:
             raise ValueError("HarnessSpec.llm_serving 未配置，且 runtime 没有 default_serving。")

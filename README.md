@@ -42,6 +42,16 @@ python demo/react-orchestration-2-agent/demo.py
 python demo/react-orchestration-2-agent-fastapi/demo.py
 ```
 
+无需模型 API Key 的新增增强示例：
+
+```bash
+python demo/skill-context/demo.py       # Skill L1 目录与 L2 降级注入
+python demo/rest-a2a-worker/demo.py     # 受保护 REST A2A Worker 与 tenant 隔离
+```
+
+前者显示来自磁盘和内联来源的技能目录，以及带 `trust="untrusted"` 边界的正文；
+后者使用进程内 FastAPI transport 展示 `401`、授权成功的 `200` 与 tenant 作用域会话键。
+
 该示例使用官方 `mcp` SDK 在每次 Worker 调用中发现 AMap 的工具，并通过
 OpenAI-compatible function calling 执行 `tools/call` 循环；端点和密钥均不写入源码。
 
@@ -51,8 +61,8 @@ OpenAI-compatible function calling 执行 `tools/call` 循环；端点和密钥�
 
 ## 可运行验证
 
-`tests/test_offline.py` 覆盖多智能体计划、内置 REACT、Magentic REACT、工具与技能声明、
-人工审批恢复与跨 runtime 会话共享，且不需要模型 API Key。外部服务场景使用
+`tests/test_offline.py` 覆盖多智能体计划、内置 REACT、Magentic REACT、Skill 解析与上下文注入、
+工具声明、人工审批恢复与跨 runtime 会话共享，且不需要模型 API Key。外部服务场景使用
 `demo/react-orchestration-2-agent/demo.py` 与
 `demo/react-orchestration-2-agent-fastapi/demo.py`。
 
@@ -63,15 +73,18 @@ OpenAI-compatible function calling 执行 `tools/call` 循环；端点和密钥�
 │   ├── contracts.py          # 全部数据类型与接口（纯定义，零逻辑）
 │   ├── collaboration.py      # 事实、任务输入与前序回执的协作快照
 │   ├── a2a.py                # A2A 协议两端与内存/HTTP 传输实现
+│   ├── skills.py             # Skill 文档、Provider、注册表与无框架解析器
 │   └── providers.py          # 可复用的内存会话与静态上下文 Provider（demo/测试）
 │   └── security.py           # 中立认证、授权与 tenant 作用域接口
 ├── deployment/               # FastAPI A2A 服务、安全边界与健康探针
 ├── harness/                  # Harness 生命周期 + AgentScope/OpenAI/MCP runtime adapter
 ├── orchestration/            # 工作流编排 + Magentic 框架引擎
-├── demo/                     # 需要真实 LLM 与 MCP 服务的端到端示例
+├── demo/                     # 外部服务端到端示例与离线增强示例
 │   ├── react-orchestration-2-agent/ # 内存 A2A：AMap 天气/POI + Maqami 航班报价
 │   └── react-orchestration-2-agent-fastapi/ # YAML 配置 + FastAPI HTTP A2A
-├── tests/test_offline.py     # 41 项离线检查
+│   ├── skill-context/        # L1/L2 Skill 注入（离线）
+│   └── rest-a2a-worker/      # 受保护 REST A2A Worker（离线）
+├── tests/test_offline.py     # 46 项离线检查
 └── docs/
     ├── 01_架构设计.md          # 分层架构 / 三角色 / 数据流 / 设计原则
     ├── 02_类设计与交互.md      # 类图 / 接口与实现对应 / 交互总图

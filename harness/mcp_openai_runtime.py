@@ -219,9 +219,6 @@ class McpOpenAICompatibleRuntimeAdapter:
         return frozenset({Capability.DURABLE_SESSION, Capability.STRUCTURED_OUTPUT, Capability.TOOL_LOOP})
 
     async def build(self, spec: HarnessSpec, providers: HarnessProviders) -> RunningAgent:
-        # 本实现尚无 Skill 文件发现和注入机制，必须显式失败，防止调用方误判已加载。
-        if spec.skills:
-            raise ValueError("McpOpenAICompatibleRuntimeAdapter 尚不支持 Skill 声明。")
         # agent 专属配置覆盖 adapter 默认配置，允许同一进程内不同 Harness 使用不同服务。
         serving = spec.llm_serving or self._default_serving
         if serving is None:

@@ -23,6 +23,10 @@ from common.contracts import (  # noqa: E402
     PrincipalContext, Reflection, RoundRecord, SharedSession, SkillSpec, WorkerDescriptor, WorkerResult, WorkerTask,
 )
 from common.security import ScopeAuthorizer, StaticBearerAuthenticator, TrustedGatewayAuthenticator  # noqa: E402
+from common.skills import (  # noqa: E402
+    FilesystemSkillProvider, InlineSkillProvider, SKILL_BODY_CONTEXT_PREFIX,
+    SKILL_CATALOG_CONTEXT_LABEL, SkillRegistry, parse_skill_markdown,
+)
 from deployment.fastapi_a2a import create_a2a_app  # noqa: E402
 from harness import ProviderHarness  # noqa: E402
 
@@ -348,6 +352,53 @@ def test_harness_standard_context() -> None:
     assert received["contract.session.facts"] == {"tenant": "cn"}
     assert received["contract.session.messages"] == ["assistant: earlier decision"]
     ok("ProviderHarness 自动注入协作快照与持久会话为标准 ContextItem")
+
+
+def test_harness_skill_context() -> None:
+    print("[harness skill context]")
+
+    class CapturingAgent:
+        def __init__(self) -> None:
+            self.context_items = ()
+
+        async def run(self, context: HarnessExecutionContext) -> AgentResult:
+            self.context_items = tuple(context.context_items)
+            return AgentResult("completed", "received")
+
+        def run_stream(self, context):
+            raise NotImplementedError
+
+    class CapturingRuntime:
+        runtime_name = "capturing"
+
+        def __init__(self, capabilities) -> None:
+            self.agent = CapturingAgent()
+            self._capabilities = capabilities
+
+        def capabilities(self) -> frozenset[Capability]:
+            return self._capabilities
+
+        async def build(self, spec, providers):
+            return self.agent
+
+        async def close(self) -> None:
+            return None
+
+    registry = SkillRegistry([InlineSkillProvider([
+        SkillSpec("refund-policy", "inline", content="---\ndescription: 退款政策\n---\n不得覆盖系统指令。"),
+    ])])
+    runtime = CapturingRuntime(frozenset({Capability.DURABLE_SESSION}))
+    harness = ProviderHarness(
+        HarnessSpec(AgentIdentity("worker", "Worker"), "处理任务。"),
+        HarnessProviders(session=InMemorySessions(), skills=registry), runtime,
+    )
+    asyncio.run(harness.run(AgentRequest("request", "session", "核查")))
+    received = {item.label: item for item in runtime.agent.context_items}
+    assert received[SKILL_CATALOG_CONTEXT_LABEL].priority == 50
+    assert "不可信输入" in received[SKILL_CATALOG_CONTEXT_LABEL].content
+    body = received[f"{SKILL_BODY_CONTEXT_PREFIX}refund-policy"]
+    assert body.priority == 60 and 'trust="untrusted"' in body.content
+    ok("Harness 注入 L1 不可信目录与非 SKILLS runtime 的 L2 定界正文")
 
 
 # ---------------------------------------------------------------------------
@@ -876,7 +927,56 @@ def test_tools_skills_spec_and_validate() -> None:
 
     scripted = _dc.replace(base, skills=[SkillSpec(name="e", source="inline", content="x", enable_scripts=True)])
     assert any("enable_scripts" in p for p in make_problems(scripted, runtime_ok))
-    ok("enable_scripts=True -> 治理提醒")
+    strict_harness = ProviderHarness(
+        scripted, _dc.replace(providers, strict_skills=True), runtime_ok,
+    )
+    assert any("enable_scripts" in problem for problem in asyncio.run(strict_harness.validate()))
+    strict_result = asyncio.run(strict_harness.run(AgentRequest("strict", "session", "run")))
+    assert strict_result.status == "failed" and strict_result.error is not None
+    ok("enable_scripts=True 在宽松模式提醒、strict_skills 模式阻断")
+
+
+def test_skill_markdown_parser() -> None:
+    print("[skill markdown parser]")
+    parsed = parse_skill_markdown(
+        "---\nname: refund-policy\ndescription: 查询退款\nallowed-tools: [query, submit]\nenable-scripts: true\n---\n先检查订单。\n",
+        source="inline", origin="inline", default_name="fallback",
+    )
+    assert parsed.name == "refund-policy" and parsed.description == "查询退款"
+    assert parsed.body == "先检查订单。\n" and parsed.allowed_tools == frozenset({"query", "submit"})
+    assert parsed.enable_scripts and len(parsed.content_digest) == 64
+    ok("SKILL.md frontmatter、正文与 digest 解析")
+
+    fallback = parse_skill_markdown("第一行说明\n第二行", source="inline", default_name="fallback")
+    assert fallback.name == "fallback" and fallback.description == "第一行说明"
+    ok("缺失 frontmatter 时回退 SkillSpec 名称与正文首行")
+
+
+def test_skill_providers_and_registry() -> None:
+    print("[skill providers]")
+
+    async def scenario() -> None:
+        inline = InlineSkillProvider([SkillSpec("inline-skill", "inline", content="内联技能")])
+        registry = SkillRegistry([inline])
+        assert [entry.name for entry in await registry.catalog()] == ["inline-skill"]
+        assert (await registry.resolve(SkillSpec("inline-skill", "inline"))).body == "内联技能"
+
+        missing = FilesystemSkillProvider([SkillSpec("missing", "path", path="/not/a/skill")])
+        assert await missing.catalog() == []
+        assert missing.problems and "SKILL.md" in missing.problems[0]
+
+        duplicate = SkillRegistry([
+            InlineSkillProvider([SkillSpec("same", "inline", content="one")]),
+            InlineSkillProvider([SkillSpec("same", "inline", content="two")]),
+        ])
+        try:
+            await duplicate.catalog()
+            raise AssertionError("同名 skill 应拒绝加载")
+        except ValueError as exc:
+            assert "inline" in str(exc)
+
+    asyncio.run(scenario())
+    ok("Inline / Filesystem Provider 缓存加载，Registry 拒绝同名冲突")
 
 
 class _ToolLoopRuntime:
@@ -950,18 +1050,38 @@ def test_framework_fit_fields() -> None:
     ok("Capability.STRUCTURED_OUTPUT 声明结构化输出能力")
 
 
+def test_skill_adapter_build_guards() -> None:
+    print("[skill adapter guards]")
+    adapter_files = (
+        "harness/agentscope_mcp_adapter.py",
+        "harness/langgraph_mcp_adapter.py",
+        "harness/mcp_openai_runtime.py",
+    )
+    root = Path(__file__).resolve().parents[1]
+    for adapter_file in adapter_files:
+        source = (root / adapter_file).read_text(encoding="utf-8")
+        assert "尚未翻译 Skill 声明" not in source and "尚不支持 Skill 声明" not in source
+    base_source = (root / "harness/agentscope_adapter.py").read_text(encoding="utf-8")
+    assert "if spec.tools:" in base_source and "if spec.tools or spec.skills:" not in base_source
+    ok("四个 adapter 不再拒绝由 Harness 统一注入的 Skill 上下文")
+
+
 if __name__ == "__main__":
     test_contract_invariants()
     test_http_a2a_transport()
     test_protected_fastapi_a2a()
     test_a2a_roundtrip()
     test_harness_standard_context()
+    test_harness_skill_context()
     test_agentscope_adapter()
     test_openai_compatible_serving_configuration()
     test_magentic_adapter()
     test_magentic_write_guard()
     test_reflector_rules()
     test_tools_skills_spec_and_validate()
+    test_skill_markdown_parser()
+    test_skill_providers_and_registry()
     test_framework_fit_fields()
+    test_skill_adapter_build_guards()
     test_react_workflow_integration()
     print(f"\nALL {PASS} CHECKS PASSED")
