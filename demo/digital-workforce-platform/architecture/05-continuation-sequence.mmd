@@ -1,0 +1,27 @@
+sequenceDiagram
+    autonumber
+    participant UI as React 控制台
+    participant API as FastAPI API
+    participant M as WorkflowRunManager
+    participant DB as SQLite
+    participant UC as UC Workflow/Harness
+    rect rgb(220, 238, 255)
+        UI->>API: GET 历史任务详情
+        UI->>API: POST /{parent_id}/continue(new goal, workers, mode)
+    end
+    rect rgb(224, 243, 232)
+        API->>M: continue_from(parent, payload)
+        M->>DB: 读取父任务 effective_json 与 session_id
+        Note over M: 不修改父任务；template 不继承，<br/>允许用户修改员工和模式
+        M->>DB: 新建子 orchestration，continued_from=parent
+    end
+    rect rgb(255, 241, 214)
+        M->>UC: 使用父任务 session_id 创建新 workflow
+        UC->>DB: SQLiteSessionProvider.load(session_id)
+        UC->>UC: 将 SharedSession 注入 Harness context
+        UC-->>M: 新轮执行结果
+    end
+    rect rgb(241, 243, 245)
+        M->>DB: 保存新结果与更新后的 SharedSession
+    end
+    API-->>UI: 新任务 ID；UI 跳转并订阅 SSE

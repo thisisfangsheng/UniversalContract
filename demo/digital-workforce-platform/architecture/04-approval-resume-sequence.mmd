@@ -1,0 +1,33 @@
+sequenceDiagram
+    autonumber
+    participant UI as React 控制台
+    participant API as FastAPI API
+    participant M as WorkflowRunManager
+    participant UC as UC A2A Worker
+    participant DB as SQLite
+    rect rgb(255, 241, 214)
+        M->>UC: 执行需要审批的 WorkerTask
+        UC-->>M: WorkerResult(needs_approval)
+    end
+    rect rgb(224, 243, 232)
+        M->>DB: 保存 ApprovalRecord 与 waiting_approval
+        M->>DB: approval_required event
+        API-->>UI: SSE approval_required
+    end
+    rect rgb(220, 238, 255)
+        UI->>API: POST approval(approve/reject, note)
+    end
+    rect rgb(224, 243, 232)
+        API->>M: approve(task_id, decision)
+        M->>DB: 保存决定，状态改为 running
+        M->>DB: approval_resolved event
+    end
+    alt approve
+        rect rgb(255, 241, 214)
+            M->>UC: 重投原 WorkerTask（相同幂等键 + resume）
+            M->>UC: 运行存储的后继 Worker
+        end
+    else reject
+        M->>DB: 保存 failed 结果
+    end
+    M->>DB: aggregate event 与最终结果

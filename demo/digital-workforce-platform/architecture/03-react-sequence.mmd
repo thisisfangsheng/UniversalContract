@@ -1,0 +1,37 @@
+sequenceDiagram
+    autonumber
+    participant M as WorkflowRunManager
+    participant UC as UC REACT workflow
+    participant R as Reflector or Magentic manager
+    participant W as A2A Workers
+    participant DB as SQLite/EventBridge
+    rect rgb(224, 243, 232)
+        M->>UC: create_workflow(mode=REACT)
+    end
+    rect rgb(255, 241, 214)
+        UC->>W: 首轮 WorkerTask
+        W-->>UC: 首轮 WorkerResult
+        UC->>R: 历史 RoundRecord + WorkerDescriptor
+    end
+    alt 未配置 LLM
+        rect rgb(255, 241, 214)
+            R-->>UC: replan(修订任务给 writer)
+            UC->>W: 第二轮增量修订任务
+            W-->>UC: 修订结果
+            UC->>R: 第二轮 RoundRecord
+            R-->>UC: done
+        end
+    else 配置 LLM
+        rect rgb(242, 227, 255)
+            R-->>UC: 选择下一位 Worker / 指令 / 是否收敛
+        end
+        loop 直到 manager 满足目标或触发 UC 护栏
+            UC->>W: 动态任务
+            W-->>UC: 回执
+            UC->>R: 更新后的协作历史
+        end
+    end
+    rect rgb(241, 243, 245)
+        UC-->>M: 多轮 OrchestrationResult
+        M->>DB: 保存 rounds、结果与 aggregate event
+    end

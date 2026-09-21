@@ -28,6 +28,9 @@ digital-workforce-platform/
 - 会话连续性：`SQLiteSessionProvider` 实现 UC `SessionProvider` 协议；`SharedSession` 按租户和 session ID 保存。历史任务“继续处理”会新建任务记录但复用 session。
 - 运行审计：SQLite 保存任务、结果快照、事件、审批与会话；前端经 SSE 展示执行轨迹。
 
+前后端分层、UC 抽象映射、持久化边界及常见场景的带编号时序图见
+[架构设计.md](架构设计.md)。可单独渲染的 Mermaid 图源位于 [architecture/](architecture/)。
+
 ## 安装
 
 ### 额外依赖
@@ -65,7 +68,7 @@ npm ci
 ```bash
 cd demo/digital-workforce-platform
 set -a; source .env 2>/dev/null || true; set +a
-PYTHONPATH=backend uvicorn digital_workforce.main:app --reload --port 8000
+PYTHONPATH=backend uvicorn digital_workforce.main:app --host 0.0.0.0 --reload --port 8000
 ```
 
 终端二启动前端：
@@ -75,7 +78,9 @@ cd demo/digital-workforce-platform/frontend
 npm run dev
 ```
 
-访问 `http://localhost:5173`。前端开发服务器将 `/api` 代理至 `http://127.0.0.1:8000`。
+Vite 监听全部网卡，因此可使用 `http://127.0.0.1:5173`、`http://localhost:5173` 或
+`http://<服务器IP>:5173` 访问。前端始终请求相对路径 `/api`；Vite 在开发时将其代理至本机
+`http://127.0.0.1:8000`，因此无需在前端写死服务器 IP，也不会产生浏览器跨域请求。
 
 也可容器化启动：
 
@@ -85,7 +90,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-容器前端地址为 `http://localhost:8080`。
+容器前端同样使用相对 `/api`，由 Nginx 转发到 Compose 内的 `backend:8000`；可使用
+`http://127.0.0.1:8080`、`http://localhost:8080` 或 `http://<服务器IP>:8080` 访问。
+请在服务器防火墙或安全组放行实际使用的前端端口（开发模式 `5173`，容器模式 `8080`）。
 
 ## 验证
 

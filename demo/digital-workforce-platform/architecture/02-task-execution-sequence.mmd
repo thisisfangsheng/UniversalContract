@@ -1,0 +1,33 @@
+sequenceDiagram
+    autonumber
+    participant UI as React 控制台
+    participant API as FastAPI API
+    participant M as WorkflowRunManager
+    participant DB as SQLite
+    participant UC as UC Workflow/A2A
+    participant W as Worker Harness
+    rect rgb(220, 238, 255)
+        UI->>API: POST /orchestrations(goal, mode, worker_ids)
+    end
+    rect rgb(224, 243, 232)
+        API->>M: create(payload, tenant)
+        M->>DB: 保存 orchestration + queued audit
+        M->>DB: 保存 plan event
+        M-->>API: orchestration_id, session_id
+        API-->>UI: 201 Created
+        UI->>API: GET events (SSE)
+    end
+    rect rgb(255, 241, 214)
+        M->>UC: create_workflow(request, endpoints)
+        UC->>W: A2A WorkerTask
+        W-->>UC: WorkerResult
+        UC-->>M: OrchestrationResult
+    end
+    rect rgb(241, 243, 245)
+        M->>DB: 事件、结果、会话快照、audit
+        DB-->>API: 按 seq 读取事件
+    end
+    rect rgb(220, 238, 255)
+        API-->>UI: SSE task_dispatch/task_receipt/aggregate
+        UI->>API: GET orchestration detail
+    end

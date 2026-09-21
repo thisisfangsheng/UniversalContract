@@ -1,0 +1,26 @@
+flowchart LR
+    classDef web fill:#DCEEFF,stroke:#1677FF,color:#102A43,stroke-width:1.5px
+    classDef platform fill:#E0F3E8,stroke:#389E5D,color:#153B2E,stroke-width:1.5px
+    classDef uc fill:#FFF1D6,stroke:#D46B08,color:#593000,stroke-width:1.5px
+    classDef external fill:#F2E3FF,stroke:#722ED1,color:#30165A,stroke-width:1.5px
+    classDef storage fill:#F1F3F5,stroke:#6C757D,color:#212529,stroke-width:1.5px
+
+    User[业务用户]:::web --> UI[React + Ant Design 控制台]:::web
+    UI -->|REST 创建/管理| API[FastAPI API<br/>digital_workforce.main]:::platform
+    API -->|SSE 事件流| UI
+    API --> Registry[WorkerRegistry<br/>配置校验与端点装配]:::platform
+    API --> Manager[WorkflowRunManager<br/>任务生命周期]:::platform
+    API --> Events[EventBridge<br/>事件序号与回放]:::platform
+    Manager --> Registry
+    Manager -->|OrchestrationRequest| Factory[UC create_workflow]:::uc
+    Registry -->|HarnessSpec + Providers| Harness[UC ProviderHarness]:::uc
+    Registry -->|A2A endpoint| A2A[UC A2AWorkerService/<br/>A2AWorkerEndpoint]:::uc
+    Factory --> A2A
+    Harness --> Session[UC SharedSession/<br/>SessionProvider]:::uc
+    Session --> SQLite[(SQLite<br/>shared_sessions)]:::storage
+    API --> SQLite
+    Manager --> SQLite
+    Events --> SQLite
+    Harness --> Runtime[Runtime adapter]:::uc
+    Runtime --> LLM[OpenAI-compatible LLM]:::external
+    Runtime --> MCP[MCP Server<br/>tools/list / tools/call]:::external
