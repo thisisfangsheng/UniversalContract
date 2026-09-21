@@ -52,6 +52,12 @@ python demo/rest-a2a-worker/demo.py     # 受保护 REST A2A Worker 与 tenant �
 前者显示来自磁盘和内联来源的技能目录，以及带 `trust="untrusted"` 边界的正文；
 后者使用进程内 FastAPI transport 展示 `401`、授权成功的 `200` 与 tenant 作用域会话键。
 
+完整的前后端数字员工平台示例位于
+[`demo/digital-workforce-platform/`](demo/digital-workforce-platform/)。它提供 Worker/MCP
+管理、任务历史、SSE 运行轨迹、审批恢复和 SQLite `SharedSession` 持久化；REACT 在有模型配置时
+使用 Magentic manager 动态编排，无模型时运行可审计的确定性修订回环。该目录的
+[`README.md`](demo/digital-workforce-platform/README.md) 包含本地与 Docker 启动方式。
+
 该示例使用官方 `mcp` SDK 在每次 Worker 调用中发现 AMap 的工具，并通过
 OpenAI-compatible function calling 执行 `tools/call` 循环；端点和密钥均不写入源码。
 
@@ -84,6 +90,7 @@ OpenAI-compatible function calling 执行 `tools/call` 循环；端点和密钥�
 │   └── react-orchestration-2-agent-fastapi/ # YAML 配置 + FastAPI HTTP A2A
 │   ├── skill-context/        # L1/L2 Skill 注入（离线）
 │   └── rest-a2a-worker/      # 受保护 REST A2A Worker（离线）
+│   └── digital-workforce-platform/ # FastAPI + React 数字员工协作平台
 ├── tests/test_offline.py     # 46 项离线检查
 └── docs/
     ├── 01_架构设计.md          # 分层架构 / 三角色 / 数据流 / 设计原则

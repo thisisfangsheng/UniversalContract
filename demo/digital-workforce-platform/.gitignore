@@ -1,0 +1,7 @@
+.env
+digital_workforce.db
+backend/*.db
+backend/**/__pycache__/
+frontend/node_modules/
+frontend/dist/
+frontend/*.tsbuildinfo

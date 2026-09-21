@@ -1,0 +1,5 @@
+# UniversalContract/requirements.txt already provides FastAPI, Pydantic and PyYAML.
+# These packages are required specifically by the persistent platform service.
+uvicorn[standard]>=0.30,<1
+sqlalchemy>=2.0,<3
+aiosqlite>=0.20,<1

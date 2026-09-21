@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: ../..
+      dockerfile: demo/digital-workforce-platform/backend/Dockerfile
+    env_file: .env
+    volumes:
+      - workforce-data:/data
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////data/digital_workforce.db
+    ports:
+      - "8000:8000"
+  frontend:
+    build:
+      context: ../..
+      dockerfile: demo/digital-workforce-platform/frontend/Dockerfile
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  workforce-data:
