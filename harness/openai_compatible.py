@@ -87,8 +87,8 @@ class OpenAICompatibleRuntimeAdapter:
         return frozenset({Capability.DURABLE_SESSION, Capability.STRUCTURED_OUTPUT})
 
     async def build(self, spec: HarnessSpec, providers: HarnessProviders) -> RunningAgent:
-        if spec.tools or spec.skills:
-            raise ValueError("OpenAICompatibleRuntimeAdapter 基础实现尚未翻译 MCP 或 Skill 声明。")
+        if spec.tools:
+            raise ValueError("OpenAICompatibleRuntimeAdapter 基础实现尚未翻译 MCP 声明。")
         serving = spec.llm_serving or self._default_serving
         if serving is None:
             raise ValueError("HarnessSpec.llm_serving 未配置，且 runtime 也没有 default_serving。")

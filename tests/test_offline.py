@@ -482,9 +482,11 @@ def test_openai_compatible_serving_configuration() -> None:
             return None
 
     calls: list[tuple[str, str]] = []
+    prompts: list[str] = []
 
     async def complete(serving, messages) -> str:
         calls.append((serving.base_url, serving.model))
+        prompts.append(messages[-1]["content"])
         if "planner" in serving.model:
             return '{"tasks": [{"task_id": "plan-1", "worker_id": "worker-a", "instruction": "check", "idempotency_key": "wf:1"}]}'
         return '{"served_by": "worker"}'
@@ -501,6 +503,24 @@ def test_openai_compatible_serving_configuration() -> None:
         assert result.data == {"served_by": "worker"}
     assert calls == [("https://a.example/v1", "worker-a-model"), ("https://b.example/v1", "worker-b-model")]
     ok("每个 HarnessSpec 独立选择自己的 OpenAI 兼容 base_url 与 model")
+
+    skill_providers = HarnessProviders(
+        session=MemorySessions(),
+        skills=SkillRegistry([InlineSkillProvider([
+            SkillSpec("writing-style", "inline", content="---\ndescription: 输出风格\n---\n使用简洁的业务语言。"),
+        ])]),
+    )
+    skill_harness = ProviderHarness(
+        HarnessSpec(AgentIdentity("writer", "Writer"), "reply", skills=[SkillSpec("writing-style", "inline")], llm_serving=serving_a),
+        skill_providers,
+        OpenAICompatibleRuntimeAdapter(complete=complete),
+    )
+    asyncio.run(skill_harness.run(AgentRequest("r-skill", "s-skill", "draft")))
+    assert calls[-1] == ("https://a.example/v1", "worker-a-model")
+    assert SKILL_CATALOG_CONTEXT_LABEL in prompts[-1]
+    assert f"{SKILL_BODY_CONTEXT_PREFIX}writing-style" in prompts[-1]
+    assert 'trust="untrusted"' in prompts[-1]
+    ok("基础 OpenAI 兼容 runtime 将 skill-only 目录与正文降级注入 prompt")
 
     planner_serving = LlmServingSpec("planner-model", "https://planner.example/v1", "planner-key")
     leader = OpenAICompatibleLeader(planner_serving, complete=complete)
