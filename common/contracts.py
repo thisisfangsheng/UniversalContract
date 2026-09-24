@@ -127,6 +127,7 @@ class AuthMode(StrEnum):
     """A2A HTTP 服务的认证终止方式。"""
 
     NONE = "none"
+    BEARER = "bearer"
     GATEWAY = "gateway"
     OIDC = "oidc"
     MTLS = "mtls"

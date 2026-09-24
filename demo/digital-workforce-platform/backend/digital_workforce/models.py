@@ -10,6 +10,35 @@ class Base(DeclarativeBase):
     pass
 
 
+class TenantRecord(Base):
+    __tablename__ = "tenants"
+
+    tenant_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    status: Mapped[str] = mapped_column(String(30), default="active", index=True)
+
+
+class UserRecord(Base):
+    __tablename__ = "users"
+
+    user_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    username: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    password_hash: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(30), default="active", index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class MembershipRecord(Base):
+    __tablename__ = "memberships"
+    __table_args__ = (UniqueConstraint("user_id", "tenant_id", name="uq_membership_user_tenant"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(80), index=True)
+    tenant_id: Mapped[str] = mapped_column(String(80), index=True)
+    role: Mapped[str] = mapped_column(String(30), default="member")
+
+
 class WorkerRecord(Base):
     __tablename__ = "workers"
 

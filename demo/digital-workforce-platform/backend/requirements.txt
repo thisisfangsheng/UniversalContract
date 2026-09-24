@@ -3,3 +3,5 @@
 uvicorn[standard]>=0.30,<1
 sqlalchemy>=2.0,<3
 aiosqlite>=0.20,<1
+argon2-cffi>=23.1,<26
+PyJWT>=2.8,<3

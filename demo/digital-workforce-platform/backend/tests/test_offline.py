@@ -147,6 +147,43 @@ async def run_tests() -> None:
                 assert len(restored_session["messages"]) == 4
 
 
+async def run_auth_tests() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        database_url = f"sqlite+aiosqlite:///{Path(directory) / 'auth.db'}"
+        app = create_app(Settings(database_url=database_url, api_token=None, auth_profile="token", jwt_secret="offline-test-secret-at-least-32-bytes"))
+        async with app.router.lifespan_context(app):
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                assert (await client.get("/api/workers")).status_code == 401
+                alice = await client.post("/api/auth/register", json={
+                    "username": "alice", "password": "a-secure-password", "display_name": "Alice",
+                    "tenant_id": "tenant-a", "tenant_name": "Tenant A",
+                })
+                assert alice.status_code == 201, alice.text
+                alice_token = alice.json()["access_token"]
+                alice_headers = {"Authorization": f"Bearer {alice_token}"}
+                created = await client.post("/api/workers", headers=alice_headers, json={
+                    "worker_id": "private-briefing", "name": "Private", "description": "Alice only",
+                })
+                assert created.status_code == 201, created.text
+                assert (await client.post("/api/auth/logout", headers=alice_headers)).status_code == 204
+                relogin = await client.post("/api/auth/login", json={"username": "alice", "password": "a-secure-password"})
+                assert relogin.status_code == 200, relogin.text
+                assert relogin.json()["tenant_id"] == "tenant-a"
+                relogin_headers = {"Authorization": f"Bearer {relogin.json()['access_token']}", "X-Tenant": relogin.json()["tenant_id"]}
+                assert {item["worker_id"] for item in (await client.get("/api/workers", headers=relogin_headers)).json()} >= {"private-briefing"}
+                bob = await client.post("/api/auth/register", json={
+                    "username": "bob", "password": "another-secure-password", "display_name": "Bob",
+                    "tenant_id": "tenant-b", "tenant_name": "Tenant B",
+                })
+                assert bob.status_code == 201, bob.text
+                bob_headers = {"Authorization": f"Bearer {bob.json()['access_token']}"}
+                assert (await client.get("/api/workers/private-briefing", headers=bob_headers)).status_code == 404
+                assert (await client.get("/api/workers", headers={**bob_headers, "X-Tenant": "tenant-a"})).status_code == 403
+                assert (await client.get("/api/workers", headers=alice_headers)).status_code == 401
+
+
 if __name__ == "__main__":
     asyncio.run(run_tests())
+    asyncio.run(run_auth_tests())
     print("ALL PLATFORM M3 CHECKS PASSED")

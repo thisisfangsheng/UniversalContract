@@ -16,6 +16,22 @@ class AuthorizationError(Exception):
     """调用方已认证但无权访问资源，HTTP 层应映射为 403。"""
 
 
+class TokenService(Protocol):
+    """token 的签发与验证抽象；JWT、opaque token 与 cookie 均可实现。"""
+
+    async def issue(self, principal: PrincipalContext, *, ttl_s: int) -> str: ...
+
+    async def verify(self, token: str) -> PrincipalContext: ...
+
+
+class TokenRevocation(Protocol):
+    """token 吊销抽象；被吊销的 token 验证必须失败。"""
+
+    async def revoke(self, token: str) -> None: ...
+
+    async def is_revoked(self, token: str) -> bool: ...
+
+
 class Authenticator(Protocol):
     """将部署层凭据归一为中立 PrincipalContext。"""
 

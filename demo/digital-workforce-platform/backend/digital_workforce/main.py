@@ -4,6 +4,7 @@ import asyncio
 import csv
 import hashlib
 import io
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -11,19 +12,23 @@ import json
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
+from common.contracts import AuthMode, McpServerSpec, McpTransport, PrincipalContext
+from common.security import AuthenticationError, AuthorizationError
 from .config import Settings, load_settings
 from .core.presets import TEMPLATES
 from .core.event_bridge import EventBridge
 from .core.registry import WorkerRegistry
 from .core.run_manager import WorkflowRunManager
-from common.contracts import McpServerSpec, McpTransport
 from common.skills import parse_skill_markdown
 from .database import make_session_factory
-from .models import Base, McpServerRecord, SkillRecord, WorkerRecord
+from .auth import InMemoryTokenRevocation, JwtTokenService
+from .identity import SqlAlchemyUserDirectory
+from .models import Base, McpServerRecord, MembershipRecord, SkillRecord, TenantRecord, UserRecord, WorkerRecord
 
 
 class OrchestrationInput(BaseModel):
@@ -69,12 +74,40 @@ class WorkerInput(BaseModel):
     enabled: bool = True
 
 
+class RegistrationInput(BaseModel):
+    username: str
+    password: str = Field(min_length=12)
+    display_name: str
+    tenant_id: str = Field(min_length=1)
+    tenant_name: str = Field(min_length=1)
+
+
+class LoginInput(BaseModel):
+    username: str
+    password: str
+    tenant_id: str = ""
+
+
+class RefreshInput(BaseModel):
+    refresh_token: str
+
+
+class MembershipInput(BaseModel):
+    username: str
+    role: str = "member"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
+    if settings.auth_profile not in {"local", "token"}:
+        raise ValueError("AUTH_PROFILE 仅支持 local 或 token")
     engine, session_factory = make_session_factory(settings.database_url)
     registry = WorkerRegistry(session_factory, settings.llm_serving())
     events = EventBridge(session_factory)
     manager = WorkflowRunManager(session_factory, registry, events)
+    identities = SqlAlchemyUserDirectory(session_factory)
+    revocation = InMemoryTokenRevocation()
+    token_service = JwtTokenService(settings.jwt_secret, revocation) if settings.auth_profile == "token" else None
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -88,15 +121,142 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.registry = registry
     app.state.manager = manager
     app.state.events = events
+    app.state.identities = identities
+    app.state.token_service = token_service
 
     def tenant(request: Request) -> str:
-        if settings.api_token and request.headers.get("X-API-Token") != settings.api_token:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid API token")
-        return settings.default_tenant_id
+        principal = getattr(request.state, "principal", None)
+        if principal is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing authenticated principal")
+        return principal.tenant_id
+
+    async def resolve_principal(request: Request) -> PrincipalContext:
+        if settings.auth_profile == "local":
+            return PrincipalContext("local-user", settings.default_tenant_id, frozenset({"owner"}), auth_mode=AuthMode.NONE)
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise AuthenticationError("缺少 Bearer token")
+        assert token_service is not None
+        authenticated = await token_service.verify(token)
+        account = await identities.get_user(authenticated.subject)
+        if account is None or account.status != "active":
+            raise AuthenticationError("用户不存在或已停用")
+        requested_tenant = request.headers.get("x-tenant", authenticated.tenant_id)
+        membership = await identities.resolve_membership(account.user_id, requested_tenant)
+        if membership is None:
+            raise AuthorizationError("用户不属于请求的租户")
+        return PrincipalContext(account.user_id, membership.tenant_id, frozenset({membership.role}), authenticated.scopes, AuthMode.BEARER)
+
+    async def token_pair(principal: PrincipalContext) -> dict[str, str | int]:
+        assert token_service is not None
+        return {
+            "access_token": await token_service.issue(principal, ttl_s=settings.access_token_ttl_s),
+            "refresh_token": await token_service.issue_refresh(principal, ttl_s=settings.refresh_token_ttl_s),
+            "token_type": "bearer",
+            "expires_in": settings.access_token_ttl_s,
+            "tenant_id": principal.tenant_id,
+        }
+
+    @app.middleware("http")
+    async def authenticate_api_requests(request: Request, call_next):
+        if request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth/") and request.url.path != "/api/health":
+            try:
+                request.state.principal = await resolve_principal(request)
+            except AuthenticationError as error:
+                return JSONResponse({"detail": str(error)}, status_code=status.HTTP_401_UNAUTHORIZED, headers={"WWW-Authenticate": "Bearer"})
+            except AuthorizationError as error:
+                return JSONResponse({"detail": str(error)}, status_code=status.HTTP_403_FORBIDDEN)
+        return await call_next(request)
 
     @app.get("/api/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.post("/api/auth/register", status_code=201)
+    async def register(payload: RegistrationInput) -> dict[str, Any]:
+        if settings.auth_profile != "token":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local profile 不提供注册")
+        async with session_factory() as session:
+            if await session.scalar(select(UserRecord).where(UserRecord.username == payload.username)):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户名已存在")
+            if await session.get(TenantRecord, payload.tenant_id):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="tenant_id 已存在")
+            account = UserRecord(
+                user_id=f"usr_{uuid.uuid4().hex}", username=payload.username, display_name=payload.display_name,
+                password_hash=identities.hash_password(payload.password), status="active",
+            )
+            session.add(TenantRecord(tenant_id=payload.tenant_id, display_name=payload.tenant_name, status="active"))
+            session.add(account)
+            session.add(MembershipRecord(user_id=account.user_id, tenant_id=payload.tenant_id, role="owner"))
+            try:
+                await session.commit()
+            except IntegrityError as error:
+                await session.rollback()
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户或租户已存在") from error
+        principal = PrincipalContext(account.user_id, payload.tenant_id, frozenset({"owner"}), auth_mode=AuthMode.BEARER)
+        return {"user": {"user_id": account.user_id, "username": account.username, "display_name": account.display_name}, "tenant_id": payload.tenant_id, **await token_pair(principal)}
+
+    @app.post("/api/auth/login")
+    async def login(payload: LoginInput) -> dict[str, str | int]:
+        if settings.auth_profile != "token":
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local profile 不提供登录")
+        account = await identities.verify(payload.username, payload.password)
+        if account is None:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="用户名或密码错误", headers={"WWW-Authenticate": "Bearer"})
+        memberships = await identities.memberships_of(account.user_id)
+        tenant_id = payload.tenant_id or (memberships[0].tenant_id if memberships else "")
+        membership = await identities.resolve_membership(account.user_id, tenant_id)
+        if membership is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户不属于请求的租户")
+        return await token_pair(PrincipalContext(account.user_id, tenant_id, frozenset({membership.role}), auth_mode=AuthMode.BEARER))
+
+    @app.post("/api/auth/refresh")
+    async def refresh(payload: RefreshInput) -> dict[str, str | int]:
+        if token_service is None:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local profile 不提供刷新")
+        try:
+            principal = await token_service.verify_refresh(payload.refresh_token)
+        except AuthenticationError as error:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(error), headers={"WWW-Authenticate": "Bearer"}) from error
+        membership = await identities.resolve_membership(principal.subject, principal.tenant_id)
+        if membership is None:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户不属于 token 租户")
+        await revocation.revoke(payload.refresh_token)
+        return await token_pair(PrincipalContext(principal.subject, membership.tenant_id, frozenset({membership.role}), auth_mode=AuthMode.BEARER))
+
+    @app.post("/api/auth/logout", status_code=204)
+    async def logout(request: Request) -> None:
+        if token_service is None:
+            return None
+        authorization = request.headers.get("authorization", "")
+        scheme, _, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少 Bearer token", headers={"WWW-Authenticate": "Bearer"})
+        await revocation.revoke(token)
+
+    @app.get("/api/auth/me")
+    async def me(request: Request) -> dict[str, Any]:
+        principal = await resolve_principal(request)
+        memberships = await identities.memberships_of(principal.subject)
+        return {"user_id": principal.subject, "tenant_id": principal.tenant_id, "roles": sorted(principal.roles), "memberships": [{"tenant_id": item.tenant_id, "role": item.role} for item in memberships]}
+
+    @app.post("/api/tenants/{tenant_id}/memberships", status_code=201)
+    async def add_membership(tenant_id: str, payload: MembershipInput, request: Request) -> dict[str, str]:
+        principal = await resolve_principal(request)
+        if principal.tenant_id != tenant_id or "owner" not in principal.roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅租户 owner 可管理成员")
+        if payload.role not in {"owner", "member", "viewer"}:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="role 仅支持 owner、member 或 viewer")
+        async with session_factory() as session:
+            account = await session.scalar(select(UserRecord).where(UserRecord.username == payload.username))
+            if account is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
+            if await session.scalar(select(MembershipRecord).where(MembershipRecord.user_id == account.user_id, MembershipRecord.tenant_id == tenant_id)):
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="成员关系已存在")
+            session.add(MembershipRecord(user_id=account.user_id, tenant_id=tenant_id, role=payload.role))
+            await session.commit()
+        return {"user_id": account.user_id, "tenant_id": tenant_id, "role": payload.role}
 
     @app.get("/api/workers")
     async def workers(request: Request) -> list[dict[str, Any]]:

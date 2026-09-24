@@ -17,6 +17,10 @@ from common.contracts import LlmServingSpec
 class Settings:
     database_url: str
     api_token: str | None
+    auth_profile: str = "local"
+    jwt_secret: str = ""
+    access_token_ttl_s: int = 900
+    refresh_token_ttl_s: int = 604800
     default_tenant_id: str = "default"
     llm_base_url: str = "https://api.openai.com/v1"
     llm_api_key: str = ""
@@ -32,6 +36,10 @@ def load_settings() -> Settings:
     return Settings(
         database_url=os.getenv("DATABASE_URL", f"sqlite+aiosqlite:///{ROOT / 'digital_workforce.db'}"),
         api_token=os.getenv("API_TOKEN"),
+        auth_profile=os.getenv("AUTH_PROFILE", "local"),
+        jwt_secret=os.getenv("JWT_SECRET", ""),
+        access_token_ttl_s=int(os.getenv("ACCESS_TOKEN_TTL_S", "900")),
+        refresh_token_ttl_s=int(os.getenv("REFRESH_TOKEN_TTL_S", "604800")),
         llm_base_url=os.getenv("UNIVERSAL_CONTRACT_LLM_BASE_URL", "https://api.openai.com/v1"),
         llm_api_key=os.getenv("UNIVERSAL_CONTRACT_LLM_API_KEY", ""),
         llm_model=os.getenv("UNIVERSAL_CONTRACT_LLM_MODEL", "gpt-4o-mini"),

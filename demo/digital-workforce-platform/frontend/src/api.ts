@@ -5,15 +5,53 @@ export type WorkflowEvent = { seq: number; ts: string; type: string; payload: { 
 export type Skill = { name: string; source: string; content: string; description: string }
 export type SkillPreview = { name: string; description: string; body: string; digest: string; allowed_tools: string[] }
 export type McpServer = { name: string; transport: string; url: string; command: string; args: string[]; allowed_tools: string[]; blocked_tools: string[] }
+export type AuthSession = { access_token: string; refresh_token: string; token_type: string; expires_in: number; tenant_id: string }
+export type CurrentUser = { user_id: string; tenant_id: string; roles: string[]; memberships: { tenant_id: string; role: string }[] }
+
+const authStorageKey = 'digital-workforce.auth'
+
+function storedSession(): AuthSession | undefined {
+  const value = sessionStorage.getItem(authStorageKey)
+  return value ? JSON.parse(value) as AuthSession : undefined
+}
+
+function storeSession(session: AuthSession): AuthSession {
+  sessionStorage.setItem(authStorageKey, JSON.stringify(session))
+  return session
+}
+
+function authHeaders(): Record<string, string> {
+  const session = storedSession()
+  return session ? { Authorization: `Bearer ${session.access_token}`, ...(session.tenant_id ? { 'X-Tenant': session.tenant_id } : {}) } : {}
+}
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) }, ...options })
+  const response = await fetch(`/api${path}`, { headers: { 'Content-Type': 'application/json', ...authHeaders(), ...(options?.headers ?? {}) }, ...options })
   if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail ?? `请求失败 (${response.status})`)
   if (response.status === 204 || response.headers.get('Content-Length') === '0') return undefined as T
   return response.json() as Promise<T>
 }
 
 export const api = {
+  session: () => storedSession(),
+  setTenant: (tenantId: string) => {
+    const session = storedSession()
+    if (!session) throw new Error('请先登录')
+    return storeSession({ ...session, tenant_id: tenantId })
+  },
+  register: async (body: { username: string; password: string; display_name: string; tenant_id: string; tenant_name: string }) => {
+    const response = await request<AuthSession & { user: { user_id: string; username: string; display_name: string } }>('/auth/register', { method: 'POST', body: JSON.stringify(body) })
+    storeSession(response)
+    return response
+  },
+  login: async (body: { username: string; password: string; tenant_id?: string }) => {
+    const response = await request<AuthSession>('/auth/login', { method: 'POST', body: JSON.stringify(body) })
+    return storeSession(response)
+  },
+  currentUser: () => request<CurrentUser>('/auth/me'),
+  logout: async () => {
+    try { await request<void>('/auth/logout', { method: 'POST' }) } finally { sessionStorage.removeItem(authStorageKey) }
+  },
   workers: () => request<Worker[]>('/workers'),
   worker: (workerId: string) => request<Worker>(`/workers/${workerId}`),
   templates: () => request<Template[]>('/orchestrations/templates'),

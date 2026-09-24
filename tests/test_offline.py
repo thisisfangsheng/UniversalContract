@@ -23,6 +23,8 @@ from common.contracts import (  # noqa: E402
     PrincipalContext, Reflection, RoundRecord, SharedSession, SkillSpec, WorkerDescriptor, WorkerResult, WorkerTask,
 )
 from common.security import ScopeAuthorizer, StaticBearerAuthenticator, TrustedGatewayAuthenticator  # noqa: E402
+from common.identity import Membership, UserAccount  # noqa: E402
+from common.providers import InMemoryUserDirectory, StaticCredentialVerifier  # noqa: E402
 from common.skills import (  # noqa: E402
     FilesystemSkillProvider, InlineSkillProvider, SKILL_BODY_CONTEXT_PREFIX,
     SKILL_CATALOG_CONTEXT_LABEL, SkillRegistry, parse_skill_markdown,
@@ -135,6 +137,26 @@ def test_contract_invariants() -> None:
     modes = {m.name for m in OrchestrationMode}
     assert "REACT" in modes and "MAGENTIC" not in modes
     ok("OrchestrationMode 新增 REACT；实现引擎（Magentic）不进入契约")
+
+
+def test_identity_contracts() -> None:
+    print("[identity]")
+    alice = UserAccount("user-alice", "alice", "Alice", "active")
+    directory = InMemoryUserDirectory(
+        [alice],
+        [Membership("user-alice", "tenant-a", "owner")],
+    )
+    verifier = StaticCredentialVerifier({("alice", "test-password"): alice})
+
+    async def scenario() -> None:
+        assert await verifier.verify("alice", "test-password") == alice
+        assert await verifier.verify("alice", "wrong-password") is None
+        assert await directory.get_user("user-alice") == alice
+        assert (await directory.resolve_membership("user-alice", "tenant-a")) is not None
+        assert await directory.resolve_membership("user-alice", "tenant-b") is None
+
+    asyncio.run(scenario())
+    ok("身份目录和凭据校验器可替换，并拒绝未注册租户成员关系")
 
 
 def test_http_a2a_transport() -> None:
@@ -1088,6 +1110,7 @@ def test_skill_adapter_build_guards() -> None:
 
 if __name__ == "__main__":
     test_contract_invariants()
+    test_identity_contracts()
     test_http_a2a_transport()
     test_protected_fastapi_a2a()
     test_a2a_roundtrip()
