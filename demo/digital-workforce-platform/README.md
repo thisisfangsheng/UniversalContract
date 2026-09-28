@@ -128,7 +128,8 @@ Vite 监听全部网卡，因此可使用 `http://127.0.0.1:5173`、`http://loca
 `http://<服务器IP>:5173` 访问。前端始终请求相对路径 `/api`；Vite 在开发时将其代理至本机
 `http://127.0.0.1:8000`，因此无需在前端写死服务器 IP，也不会产生浏览器跨域请求。
 
-也可容器化启动：
+也可容器化启动。需要 Docker Engine 和 Docker Compose v2（`docker compose`）；Compose 会构建前后端镜像，
+将 SQLite 数据库持久化到 `workforce-data` volume，并发布后端 `8000` 端口和 Nginx 前端 `8080` 端口：
 
 ```bash
 cd demo/digital-workforce-platform
@@ -139,6 +140,9 @@ docker compose up --build
 容器前端同样使用相对 `/api`，由 Nginx 转发到 Compose 内的 `backend:8000`；可使用
 `http://127.0.0.1:8080`、`http://localhost:8080` 或 `http://<服务器IP>:8080` 访问。
 请在服务器防火墙或安全组放行实际使用的前端端口（开发模式 `5173`，容器模式 `8080`）。
+容器模式默认仍为 `AUTH_PROFILE=local`；要启用用户登录和租户隔离，应在启动前编辑 `.env`，设置
+`AUTH_PROFILE=token` 并为 `JWT_SECRET` 填入至少 32 字节的稳定随机值。生产部署应通过部署平台的 Secret
+注入机制提供该文件中的模型密钥和 JWT 密钥，不能将 `.env`、SQLite 数据库或本地虚拟环境打入镜像。
 
 ## 验证
 
