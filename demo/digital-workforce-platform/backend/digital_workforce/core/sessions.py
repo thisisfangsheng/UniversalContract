@@ -8,22 +8,24 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from common.contracts import SharedSession
 
-from ..models import SessionRecord
+from ..models import UserSessionRecord
 
 
 class SQLiteSessionProvider:
-    """Tenant-scoped UC SessionProvider persisted as neutral SharedSession JSON."""
+    """Tenant- and user-scoped UC SessionProvider persisted as neutral SharedSession JSON."""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], tenant_id: str) -> None:
+    def __init__(self, sessions: async_sessionmaker[AsyncSession], tenant_id: str, owner_user_id: str) -> None:
         self._sessions = sessions
         self._tenant_id = tenant_id
+        self._owner_user_id = owner_user_id
         self._locks: dict[str, asyncio.Lock] = {}
 
     async def load(self, session_id: str) -> SharedSession:
         async with self._sessions() as session:
-            record = await session.scalar(select(SessionRecord).where(
-                SessionRecord.tenant_id == self._tenant_id,
-                SessionRecord.session_id == session_id,
+            record = await session.scalar(select(UserSessionRecord).where(
+                UserSessionRecord.tenant_id == self._tenant_id,
+                UserSessionRecord.owner_user_id == self._owner_user_id,
+                UserSessionRecord.session_id == session_id,
             ))
             if record is None:
                 return SharedSession(session_id)
@@ -44,12 +46,13 @@ class SQLiteSessionProvider:
         lock = self._locks.setdefault(shared_session.session_id, asyncio.Lock())
         async with lock:
             async with self._sessions() as session:
-                record = await session.scalar(select(SessionRecord).where(
-                    SessionRecord.tenant_id == self._tenant_id,
-                    SessionRecord.session_id == shared_session.session_id,
+                record = await session.scalar(select(UserSessionRecord).where(
+                    UserSessionRecord.tenant_id == self._tenant_id,
+                    UserSessionRecord.owner_user_id == self._owner_user_id,
+                    UserSessionRecord.session_id == shared_session.session_id,
                 ))
                 if record is None:
-                    session.add(SessionRecord(tenant_id=self._tenant_id, session_id=shared_session.session_id, payload_json=payload))
+                    session.add(UserSessionRecord(tenant_id=self._tenant_id, owner_user_id=self._owner_user_id, session_id=shared_session.session_id, payload_json=payload))
                 else:
                     record.payload_json = payload
                 await session.commit()

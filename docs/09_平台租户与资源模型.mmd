@@ -1,0 +1,27 @@
+flowchart TB
+    Platform[平台]
+    Catalog[平台能力目录<br/>Worker / Skill / MCP Server]
+    Tenant[租户]
+    Rule[租户工作规则<br/>system_prompt]
+    Template[流程模板 SOP<br/>draft / published / version]
+    UserA[用户 A：owner]
+    UserB[用户 B：member]
+    Run[执行实例<br/>模板快照 + 会话 + 审计]
+    Access[实例 ACL<br/>viewer / approver / collaborator]
+    Binding[租户连接器绑定与凭据<br/>预留]
+
+    Platform --> Catalog
+    Platform --> Tenant
+    Tenant --> Rule
+    Tenant --> Template
+    UserA -->|owner membership| Tenant
+    UserB -->|member membership| Tenant
+    UserA -->|定义、发布| Template
+    UserB -->|选择已发布版本| Template
+    Catalog -->|模板引用 Worker| Template
+    UserB -->|创建，默认私有| Run
+    Template -->|版本 + 定义快照| Run
+    UserB -->|owner 可授予| Access
+    Access -->|受控访问| Run
+    Tenant -.未来绑定.-> Binding
+    Binding -.未来为 Worker 提供.-> Catalog

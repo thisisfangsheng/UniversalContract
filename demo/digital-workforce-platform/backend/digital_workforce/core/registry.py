@@ -22,7 +22,7 @@ from harness.openai_compatible import OpenAICompatibleRuntimeAdapter
 
 from .presets import WORKER_PRESETS, WorkerPreset
 from .sessions import SQLiteSessionProvider
-from ..models import McpServerRecord, WorkerRecord
+from ..models import CatalogMcpServerRecord, CatalogWorkerRecord, TenantContextRecord
 
 
 class OfflineAgent:
@@ -61,16 +61,17 @@ class OfflineRuntime:
 
 
 class WorkerRegistry:
-    """Tenant-scoped Harness registry. Workers share one SessionProvider per tenant."""
+    """Global capability registry with tenant- and user-scoped session state."""
 
     def __init__(self, sessions, llm_serving: LlmServingSpec | None = None) -> None:
         self._sessions = sessions
         self._llm_serving = llm_serving
-        self._providers: dict[str, SQLiteSessionProvider] = {}
+        self._providers: dict[tuple[str, str], SQLiteSessionProvider] = {}
         self._presets = {preset.worker_id: preset for preset in WORKER_PRESETS}
 
-    def session_provider_for(self, tenant_id: str) -> SQLiteSessionProvider:
-        return self._providers.setdefault(tenant_id, SQLiteSessionProvider(self._sessions, tenant_id))
+    def session_provider_for(self, tenant_id: str, owner_user_id: str) -> SQLiteSessionProvider:
+        key = (tenant_id, owner_user_id)
+        return self._providers.setdefault(key, SQLiteSessionProvider(self._sessions, tenant_id, owner_user_id))
 
     @property
     def llm_serving(self) -> LlmServingSpec | None:
@@ -78,13 +79,13 @@ class WorkerRegistry:
 
     async def list_workers(self, tenant_id: str) -> Sequence[WorkerPreset]:
         async with self._sessions() as session:
-            records = (await session.scalars(select(WorkerRecord).where(WorkerRecord.tenant_id == tenant_id))).all()
+            records = (await session.scalars(select(CatalogWorkerRecord))).all()
         custom = {record.worker_id: self._record_to_preset(record) for record in records}
         return tuple({**self._presets, **custom}.values())
 
     async def get_worker(self, worker_id: str, tenant_id: str) -> WorkerPreset:
         async with self._sessions() as session:
-            record = await session.get(WorkerRecord, {"worker_id": worker_id, "tenant_id": tenant_id})
+            record = await session.get(CatalogWorkerRecord, worker_id)
         preset = self._record_to_preset(record) if record is not None else self._presets.get(worker_id)
         if preset is None:
             raise KeyError(worker_id)
@@ -98,10 +99,10 @@ class WorkerRegistry:
         preset = WorkerPreset(worker_id, str(payload["name"]), str(payload["description"]), str(payload.get("runtime_name", "offline-contract")), tuple(payload.get("capabilities", [])), skills, tuple(payload.get("mcp_server_names", [])), bool(payload.get("enabled", True)))
         await self._validate_preset(preset, tenant_id)
         async with self._sessions() as session:
-            existing = await session.get(WorkerRecord, {"worker_id": worker_id, "tenant_id": tenant_id})
+            existing = await session.get(CatalogWorkerRecord, worker_id)
             if existing is not None or worker_id in self._presets:
                 raise ValueError("worker_id 已存在")
-            session.add(WorkerRecord(worker_id=worker_id, tenant_id=tenant_id, display_name=preset.name, description=preset.description, runtime_name=preset.runtime_name, enabled=preset.enabled, config_json=json.dumps({"capabilities": preset.capabilities, "skills": preset.skills, "mcp_server_names": preset.mcp_server_names}, ensure_ascii=False)))
+            session.add(CatalogWorkerRecord(worker_id=worker_id, display_name=preset.name, description=preset.description, runtime_name=preset.runtime_name, enabled=preset.enabled, config_json=json.dumps({"capabilities": preset.capabilities, "skills": preset.skills, "mcp_server_names": preset.mcp_server_names}, ensure_ascii=False)))
             await session.commit()
         return preset
 
@@ -109,7 +110,7 @@ class WorkerRegistry:
         if worker_id in self._presets:
             raise ValueError("内置员工由出厂预设管理，不能删除")
         async with self._sessions() as session:
-            record = await session.get(WorkerRecord, {"worker_id": worker_id, "tenant_id": tenant_id})
+            record = await session.get(CatalogWorkerRecord, worker_id)
             if record is None:
                 raise KeyError(worker_id)
             await session.delete(record)
@@ -121,14 +122,14 @@ class WorkerRegistry:
         if str(payload.get("worker_id", worker_id)) != worker_id:
             raise ValueError("worker_id 创建后不可修改")
         async with self._sessions() as session:
-            record = await session.get(WorkerRecord, {"worker_id": worker_id, "tenant_id": tenant_id})
+            record = await session.get(CatalogWorkerRecord, worker_id)
             if record is None:
                 raise KeyError(worker_id)
         skills = tuple((str(item["name"]), str(item["description"]), "catalog") for item in payload.get("skills", []) if item.get("name") and item.get("description"))
         preset = WorkerPreset(worker_id, str(payload["name"]), str(payload["description"]), str(payload.get("runtime_name", "offline-contract")), tuple(payload.get("capabilities", [])), skills, tuple(payload.get("mcp_server_names", [])), bool(payload.get("enabled", True)))
         await self._validate_preset(preset, tenant_id)
         async with self._sessions() as session:
-            record = await session.get(WorkerRecord, {"worker_id": worker_id, "tenant_id": tenant_id})
+            record = await session.get(CatalogWorkerRecord, worker_id)
             if record is None:
                 raise KeyError(worker_id)
             record.display_name = preset.name
@@ -144,14 +145,14 @@ class WorkerRegistry:
         await self._validate_preset(preset, tenant_id)
         return []
 
-    async def endpoints_for(self, worker_ids: Sequence[str], tenant_id: str) -> list[A2AWorkerEndpoint]:
+    async def endpoints_for(self, worker_ids: Sequence[str], tenant_id: str, owner_user_id: str) -> list[A2AWorkerEndpoint]:
         presets = [await self.get_worker(worker_id, tenant_id) for worker_id in worker_ids]
         missing = [preset.worker_id for preset in presets if not preset.enabled]
         if missing:
             raise KeyError(", ".join(missing))
         services: dict[str, A2AWorkerService] = {}
         endpoint_specs: list[tuple[WorkerPreset, ProviderHarness, str]] = []
-        session = self.session_provider_for(tenant_id)
+        session = self.session_provider_for(tenant_id, owner_user_id)
         for preset in presets:
             skill_specs = []
             for name, description, _origin in preset.skills:
@@ -173,7 +174,7 @@ class WorkerRegistry:
         ]
 
     async def _validate_preset(self, preset: WorkerPreset, tenant_id: str) -> None:
-        session = self.session_provider_for(tenant_id)
+        session = self.session_provider_for(tenant_id, "catalog-validation")
         spec = await self._harness_spec_for(preset, tenant_id, ())
         problems = await ProviderHarness(spec, HarnessProviders(session=session), self._runtime_for(preset)).validate()
         if problems:
@@ -237,13 +238,19 @@ class WorkerRegistry:
         capabilities = {Capability.DURABLE_SESSION, Capability.STRUCTURED_OUTPUT}
         if servers:
             capabilities.add(Capability.TOOL_LOOP)
-        return HarnessSpec(AgentIdentity(preset.worker_id, preset.name, preset.description), f"你是{preset.name}。请根据任务与协作上下文完成工作。", frozenset(capabilities), tools=servers, skills=tuple(skills), llm_serving=self._llm_serving)
+        async with self._sessions() as session:
+            context = await session.get(TenantContextRecord, tenant_id)
+        tenant_prompt = context.system_prompt.strip() if context is not None else ""
+        system_prompt = f"你是{preset.name}。请根据任务与协作上下文完成工作。"
+        if tenant_prompt:
+            system_prompt = f"{system_prompt}\n\n租户工作规则：\n{tenant_prompt}"
+        return HarnessSpec(AgentIdentity(preset.worker_id, preset.name, preset.description), system_prompt, frozenset(capabilities), tools=servers, skills=tuple(skills), llm_serving=self._llm_serving)
 
     async def _mcp_servers_for(self, names: Sequence[str], tenant_id: str) -> tuple[McpServerSpec, ...]:
         if not names:
             return ()
         async with self._sessions() as session:
-            records = (await session.scalars(select(McpServerRecord).where(McpServerRecord.tenant_id == tenant_id, McpServerRecord.name.in_(names)))).all()
+            records = (await session.scalars(select(CatalogMcpServerRecord).where(CatalogMcpServerRecord.name.in_(names)))).all()
         found = {record.name: record for record in records}
         missing = [name for name in names if name not in found]
         if missing:
@@ -251,7 +258,7 @@ class WorkerRegistry:
         return tuple(McpServerSpec(name=record.name, transport=McpTransport(record.transport), url=record.url, command=record.command, args=tuple(json.loads(record.args_json)), allowed_tools=frozenset(json.loads(record.allowed_tools_json)), blocked_tools=frozenset(json.loads(record.blocked_tools_json))) for record in (found[name] for name in names))
 
     @staticmethod
-    def _record_to_preset(record: WorkerRecord) -> WorkerPreset:
+    def _record_to_preset(record: CatalogWorkerRecord) -> WorkerPreset:
         config = json.loads(record.config_json)
         return WorkerPreset(record.worker_id, record.display_name, record.description, record.runtime_name, tuple(config.get("capabilities", [])), tuple(tuple(item) for item in config.get("skills", [])), tuple(config.get("mcp_server_names", [])), record.enabled)
 

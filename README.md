@@ -54,7 +54,7 @@ python demo/rest-a2a-worker/demo.py     # 受保护 REST A2A Worker 与 tenant �
 
 完整的前后端数字员工平台示例位于
 [`demo/digital-workforce-platform/`](demo/digital-workforce-platform/)。它提供 Worker/MCP
-管理、任务历史、SSE 运行轨迹、审批恢复和 SQLite `SharedSession` 持久化；REACT 在有模型配置时
+管理、tenant owner 的 SOP 流程模板、默认私有且可授权共享的执行实例、任务历史、SSE 运行轨迹、审批恢复和 SQLite `SharedSession` 持久化；REACT 在有模型配置时
 使用 Magentic manager 动态编排，无模型时运行可审计的确定性修订回环。该目录的
 [`README.md`](demo/digital-workforce-platform/README.md) 包含本地与 Docker 启动方式。
 
@@ -100,6 +100,8 @@ OpenAI-compatible function calling 执行 `tools/call` 循环；端点和密钥�
     └── 05_协作状态共享.md      # 跨 mode、跨 runtime 的协作状态协议
     └── 06_用户安装手册.md       # pip 安装、验证、运行示例与常见问题
     └── 07_部署与认证指南.md     # 本地/云端部署、IAM 与多租户隔离
+    └── 08_用户认证与隔离.md     # 平台登录、SOP 发布与执行实例 ACL
+    └── 09_平台租户与资源模型.md # 用户、租户、SOP、员工和执行实例的关系
 ```
 
 ## 最小使用示例

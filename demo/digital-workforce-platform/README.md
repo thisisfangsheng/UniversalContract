@@ -25,12 +25,14 @@ digital-workforce-platform/
 - MCP 治理：为每个 Worker 显式绑定 MCP Server，并在保存时验证 runtime、传输与工具白名单兼容性。
 - 协作模式：顺序、并行、接力审批及 REACT 编排。
 - REACT：没有模型时执行“首轮协作 -> 修订整合”的确定性回环；配置模型后使用 UC Magentic manager，根据 Worker 能力和回执动态选人、重规划并收敛。
-- 会话连续性：`SQLiteSessionProvider` 实现 UC `SessionProvider` 协议；`SharedSession` 按租户和 session ID 保存。历史任务“继续处理”会新建任务记录但复用 session。
+- 会话连续性：`SQLiteSessionProvider` 实现 UC `SessionProvider` 协议；`SharedSession` 按租户、发起用户和 session ID 保存。历史任务“继续处理”会新建任务记录但复用 session。
 - 运行审计：SQLite 保存任务、结果快照、事件、审批与会话；前端经 SSE 展示执行轨迹。
-- 身份与租户：可选 JWT 登录 profile。账户与租户通过 membership 关联；动态 Worker、Skill、MCP Server、任务和会话按租户隔离。
+- 身份与租户：可选 JWT 登录 profile。账户与租户通过 membership 关联；Worker、Skill、MCP Server 是全局能力目录；tenant owner 管理 SOP 流程模板，成员使用已发布模板；执行实例默认私有并支持显式共享。
 
 前后端分层、UC 抽象映射、持久化边界及常见场景的带编号时序图见
 [架构设计.md](架构设计.md)。可单独渲染的 Mermaid 图源位于 [architecture/](architecture/)。
+用户、租户、SOP、平台能力目录与执行实例的关系见
+[平台租户与资源模型](../../docs/09_平台租户与资源模型.md)。
 
 ## 安装
 
@@ -88,13 +90,14 @@ JWT_SECRET="$(python -c 'import secrets; print(secrets.token_urlsafe(48))')"
 1. 以 `token` profile 启动后端，在控制台打开“身份与租户”。
 2. 首次使用选择“注册账户并创建租户”，填写用户名、至少 12 位的密码、显示名称、租户 ID 和名称。
 	注册会创建用户、租户以及该用户的 `owner` membership，并自动登录。
-3. 创建动态员工、登记 MCP Server、维护 Skill、发起任务；它们全部保存到当前租户。
-4. 在“身份与租户”下拉框选择已加入的其他租户即可切换工作空间。浏览器会携带 Bearer token 和
-	当前 `X-Tenant`；后端每次都重新验证 membership。
-5. 退出登录会吊销当前 access token。再次登录时平台返回默认 membership tenant，之前在该租户创建
-	的动态员工、MCP、Skill 和任务仍然可见。
+3. 创建或选择全局数字员工、MCP Server 和 Skill。能力目录可被其他租户复用；不要在全局 MCP 定义中保存租户私有密钥。
+4. tenant owner 在“流程模板”定义 SOP，选择编排模式和参与员工。模板先保存为 `draft`，发布为 `published` 后，tenant member 才能在“发起任务”中使用它。
+5. 发起任务时平台固化 SOP 的版本和定义快照。owner 可在任务详情向同租户成员授权 `viewer`（查看）、`approver`（审批）或 `collaborator`（审批和续办）；未授权实例仍保持私有。
+6. 在“身份与租户”下拉框选择已加入的其他租户即可切换工作空间。浏览器会携带 Bearer token 和
+	当前 `X-Tenant`；后端每次都重新验证 membership。owner 还可维护该租户的系统工作规则，它会追加到后续任务中每个员工的系统提示词。
+7. 退出登录会吊销当前 access token。再次登录时平台返回默认 membership tenant；该用户创建的任务和会话仍然可见，其他用户和其他租户只有获得实例 ACL 后才能访问。
 
-owner 可将已经注册的用户加入当前租户：
+owner 可在“身份与租户”页面的“添加租户成员”表单中，将已经注册的用户名加入当前租户并选择角色。后端仍提供以下 API，便于自动化管理：
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/tenants/<tenant_id>/memberships \
@@ -104,8 +107,11 @@ curl -X POST http://127.0.0.1:8000/api/tenants/<tenant_id>/memberships \
 ```
 
 角色可为 `owner`、`member`、`viewer`。当前参考实现已强制跨租户隔离：无凭据或无效/过期/吊销
-token 返回 `401`，请求未加入的 tenant 返回 `403`。同一租户内按资源创建者控制读写的 ACL 尚未实现，
-因此不应将角色误解为完整的资源级授权策略。
+token 返回 `401`，请求未加入的 tenant 返回 `403`。同一租户内的任务和会话也按发起用户隔离；全局目录
+的精细发布与编辑授权仍应在生产环境接入平台级 `CatalogAuthorizer`。
+
+此版本不迁移旧数据库。升级前请停止服务并删除 `digital_workforce.db`，再启动平台创建包含全局能力目录、
+租户 SOP 模板、执行快照与实例 ACL 的新数据库。
 
 ## 启动
 

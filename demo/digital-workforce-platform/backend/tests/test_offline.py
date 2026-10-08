@@ -10,9 +10,9 @@ from digital_workforce.config import Settings
 from digital_workforce.main import create_app
 
 
-async def _wait_for_terminal(client: httpx.AsyncClient, orchestration_id: str) -> dict:
+async def _wait_for_terminal(client: httpx.AsyncClient, orchestration_id: str, headers: dict[str, str] | None = None) -> dict:
     for _ in range(40):
-        response = await client.get(f"/api/orchestrations/{orchestration_id}")
+        response = await client.get(f"/api/orchestrations/{orchestration_id}", headers=headers)
         response.raise_for_status()
         payload = response.json()
         if payload["status"] not in {"queued", "running"}:
@@ -172,14 +172,50 @@ async def run_auth_tests() -> None:
                 assert relogin.json()["tenant_id"] == "tenant-a"
                 relogin_headers = {"Authorization": f"Bearer {relogin.json()['access_token']}", "X-Tenant": relogin.json()["tenant_id"]}
                 assert {item["worker_id"] for item in (await client.get("/api/workers", headers=relogin_headers)).json()} >= {"private-briefing"}
+                tenant_context = await client.put("/api/tenant-context", headers=relogin_headers, json={"system_prompt": "不得向其他租户泄露本租户的内容。"})
+                assert tenant_context.status_code == 200 and tenant_context.json()["system_prompt"].startswith("不得")
+                alice_run = await client.post("/api/orchestrations", headers=relogin_headers, json={"goal": "仅 Alice 可查看的会话", "mode": "sequential", "worker_ids": ["private-briefing"]})
+                assert alice_run.status_code == 201, alice_run.text
+                alice_orchestration_id = alice_run.json()["orchestration_id"]
+                assert (await _wait_for_terminal(client, alice_orchestration_id, relogin_headers))["status"] == "completed"
                 bob = await client.post("/api/auth/register", json={
                     "username": "bob", "password": "another-secure-password", "display_name": "Bob",
                     "tenant_id": "tenant-b", "tenant_name": "Tenant B",
                 })
                 assert bob.status_code == 201, bob.text
                 bob_headers = {"Authorization": f"Bearer {bob.json()['access_token']}"}
-                assert (await client.get("/api/workers/private-briefing", headers=bob_headers)).status_code == 404
-                assert (await client.get("/api/workers", headers={**bob_headers, "X-Tenant": "tenant-a"})).status_code == 403
+                assert (await client.get("/api/workers/private-briefing", headers=bob_headers)).status_code == 200
+                assert (await client.post("/api/tenants/tenant-a/memberships", headers=relogin_headers, json={"username": "bob", "role": "member"})).status_code == 201
+                bob_in_tenant_a = {**bob_headers, "X-Tenant": "tenant-a"}
+                assert {item["worker_id"] for item in (await client.get("/api/workers", headers=bob_in_tenant_a)).json()} >= {"private-briefing"}
+                assert (await client.get(f"/api/orchestrations/{alice_orchestration_id}", headers=bob_in_tenant_a)).status_code == 404
+                template_payload = {
+                    "name": "Briefing SOP", "description": "Tenant A briefing", "status": "draft",
+                    "mode": "sequential", "worker_ids": ["private-briefing"], "facts": {"source": "tenant-a"}, "react": {},
+                }
+                assert (await client.post("/api/process-templates", headers=bob_in_tenant_a, json=template_payload)).status_code == 403
+                template = await client.post("/api/process-templates", headers=relogin_headers, json=template_payload)
+                assert template.status_code == 201, template.text
+                template_id = template.json()["id"]
+                assert (await client.get("/api/process-templates", headers=bob_in_tenant_a)).json() == []
+                published_payload = {**template_payload, "status": "published"}
+                published = await client.put(f"/api/process-templates/{template_id}", headers=relogin_headers, json=published_payload)
+                assert published.status_code == 200, published.text
+                assert published.json()["version"] == 2
+                assert [item["id"] for item in (await client.get("/api/process-templates", headers=bob_in_tenant_a)).json()] == [template_id]
+                template_run = await client.post("/api/orchestrations", headers=bob_in_tenant_a, json={"goal": "使用已发布 SOP", "template_id": template_id})
+                assert template_run.status_code == 201, template_run.text
+                template_record = await client.get(f"/api/orchestrations/{template_run.json()['orchestration_id']}", headers=bob_in_tenant_a)
+                assert template_record.status_code == 200
+                assert template_record.json()["template_id"] == template_id and template_record.json()["template_version"] == 2
+                grant = await client.post(f"/api/orchestrations/{alice_orchestration_id}/access", headers=relogin_headers, json={"username": "bob", "access_level": "viewer"})
+                assert grant.status_code == 201, grant.text
+                assert (await client.get(f"/api/orchestrations/{alice_orchestration_id}", headers=bob_in_tenant_a)).status_code == 200
+                bob_run = await client.post("/api/orchestrations", headers=bob_in_tenant_a, json={"goal": "Bob 的独立会话", "mode": "sequential", "worker_ids": ["private-briefing"], "session_id": alice_run.json()["session_id"]})
+                assert bob_run.status_code == 201, bob_run.text
+                assert (await _wait_for_terminal(client, bob_run.json()["orchestration_id"], bob_in_tenant_a))["status"] == "completed"
+                assert (await client.get(f"/api/orchestrations/{bob_run.json()['orchestration_id']}/session", headers=bob_in_tenant_a)).status_code == 200
+                assert (await client.get("/api/workers", headers={**bob_headers, "X-Tenant": "missing-tenant"})).status_code == 403
                 assert (await client.get("/api/workers", headers=alice_headers)).status_code == 401
 
 

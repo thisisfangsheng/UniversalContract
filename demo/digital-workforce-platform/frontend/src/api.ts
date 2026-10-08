@@ -1,12 +1,13 @@
 export type Worker = { worker_id: string; name: string; description: string; runtime_name: string; enabled: boolean; editable: boolean; capabilities: string[]; mcp_server_names: string[]; mcp_tools: string[]; skill_catalog: { name: string; description: string; origin: string }[] }
-export type Template = { id: string; name: string; mode: string; worker_ids: string[] }
-export type Orchestration = { orchestration_id: string; session_id: string; goal: string; mode: string; status: string; continued_from?: string; result?: { summary: string; worker_results: { task_id: string; worker_id: string; status: string; output: { text?: string } }[] }; session?: { messages: string[] }; effective: { worker_ids: string[]; facts?: Record<string, unknown>; react?: Record<string, unknown> } }
+export type Template = { id: string; name: string; description: string; status: 'draft' | 'published'; version: number; mode: string; worker_ids: string[]; facts: Record<string, unknown>; react: Record<string, unknown> }
+export type Orchestration = { orchestration_id: string; session_id: string; goal: string; mode: string; status: string; template_id?: string; template_version?: number; continued_from?: string; result?: { summary: string; worker_results: { task_id: string; worker_id: string; status: string; output: { text?: string } }[] }; session?: { messages: string[] }; effective: { worker_ids: string[]; facts?: Record<string, unknown>; react?: Record<string, unknown> } }
 export type WorkflowEvent = { seq: number; ts: string; type: string; payload: { task_id?: string; worker_id?: string; status?: string; instruction?: string; error?: string } }
 export type Skill = { name: string; source: string; content: string; description: string }
 export type SkillPreview = { name: string; description: string; body: string; digest: string; allowed_tools: string[] }
 export type McpServer = { name: string; transport: string; url: string; command: string; args: string[]; allowed_tools: string[]; blocked_tools: string[] }
 export type AuthSession = { access_token: string; refresh_token: string; token_type: string; expires_in: number; tenant_id: string }
 export type CurrentUser = { user_id: string; tenant_id: string; roles: string[]; memberships: { tenant_id: string; role: string }[] }
+export type TenantContext = { tenant_id: string; system_prompt: string }
 
 const authStorageKey = 'digital-workforce.auth'
 
@@ -49,16 +50,24 @@ export const api = {
     return storeSession(response)
   },
   currentUser: () => request<CurrentUser>('/auth/me'),
+  addMembership: (tenantId: string, body: { username: string; role: 'owner' | 'member' | 'viewer' }) => request<{ user_id: string; tenant_id: string; role: string }>(`/tenants/${encodeURIComponent(tenantId)}/memberships`, { method: 'POST', body: JSON.stringify(body) }),
+  tenantContext: () => request<TenantContext>('/tenant-context'),
+  updateTenantContext: (system_prompt: string) => request<TenantContext>('/tenant-context', { method: 'PUT', body: JSON.stringify({ system_prompt }) }),
   logout: async () => {
     try { await request<void>('/auth/logout', { method: 'POST' }) } finally { sessionStorage.removeItem(authStorageKey) }
   },
   workers: () => request<Worker[]>('/workers'),
   worker: (workerId: string) => request<Worker>(`/workers/${workerId}`),
   templates: () => request<Template[]>('/orchestrations/templates'),
+  processTemplates: () => request<Template[]>('/process-templates'),
+  createProcessTemplate: (body: Omit<Template, 'id' | 'version'>) => request<Template>('/process-templates', { method: 'POST', body: JSON.stringify(body) }),
+  updateProcessTemplate: (templateId: string, body: Omit<Template, 'id' | 'version'>) => request<Template>(`/process-templates/${encodeURIComponent(templateId)}`, { method: 'PUT', body: JSON.stringify(body) }),
   listRuns: () => request<Orchestration[]>('/orchestrations'),
   run: (id: string) => request<Orchestration>(`/orchestrations/${id}`),
+  eventStream: (orchestrationId: string, signal: AbortSignal) => fetch(`/api/orchestrations/${encodeURIComponent(orchestrationId)}/events`, { headers: authHeaders(), signal }),
   create: (body: unknown) => request<{ orchestration_id: string; session_id: string; status: string }>('/orchestrations', { method: 'POST', body: JSON.stringify(body) }),
   continueRun: (orchestrationId: string, body: unknown) => request<{ orchestration_id: string; session_id: string; status: string }>(`/orchestrations/${orchestrationId}/continue`, { method: 'POST', body: JSON.stringify(body) }),
+  grantRunAccess: (orchestrationId: string, body: { username: string; access_level: 'viewer' | 'approver' | 'collaborator' }) => request<{ orchestration_id: string; username: string; access_level: string }>(`/orchestrations/${orchestrationId}/access`, { method: 'POST', body: JSON.stringify(body) }),
   approve: (orchestrationId: string, taskId: string, decision: 'approve' | 'reject', note: string) => request<{ status: string }>(`/orchestrations/${orchestrationId}/approvals/${taskId}`, { method: 'POST', body: JSON.stringify({ decision, note }) }),
   skills: () => request<Skill[]>('/skills'),
   createSkill: (body: Pick<Skill, 'name' | 'content' | 'source'>) => request<Skill>('/skills', { method: 'POST', body: JSON.stringify(body) }),

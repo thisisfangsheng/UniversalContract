@@ -18,6 +18,13 @@ class TenantRecord(Base):
     status: Mapped[str] = mapped_column(String(30), default="active", index=True)
 
 
+class TenantContextRecord(Base):
+    __tablename__ = "tenant_contexts"
+
+    tenant_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    system_prompt: Mapped[str] = mapped_column(Text, default="")
+
+
 class UserRecord(Base):
     __tablename__ = "users"
 
@@ -39,16 +46,18 @@ class MembershipRecord(Base):
     role: Mapped[str] = mapped_column(String(30), default="member")
 
 
-class WorkerRecord(Base):
-    __tablename__ = "workers"
+class ProcessTemplateRecord(Base):
+    __tablename__ = "process_templates"
+    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_process_template_tenant_name"),)
 
-    worker_id: Mapped[str] = mapped_column(String(80), primary_key=True)
-    tenant_id: Mapped[str] = mapped_column(String(80), primary_key=True, default="default")
-    display_name: Mapped[str] = mapped_column(String(120))
-    description: Mapped[str] = mapped_column(Text)
-    runtime_name: Mapped[str] = mapped_column(String(80))
-    enabled: Mapped[bool] = mapped_column(default=True)
-    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    template_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(80), index=True)
+    name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(30), default="draft", index=True)
+    version: Mapped[int] = mapped_column(Integer, default=1)
+    definition_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_by_user_id: Mapped[str] = mapped_column(String(80), index=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
@@ -57,6 +66,10 @@ class OrchestrationRecord(Base):
 
     orchestration_id: Mapped[str] = mapped_column(String(80), primary_key=True)
     tenant_id: Mapped[str] = mapped_column(String(80), default="default", index=True)
+    owner_user_id: Mapped[str] = mapped_column(String(80), default="local-user", index=True)
+    template_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    template_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    template_snapshot_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     workflow_id: Mapped[str] = mapped_column(String(120), unique=True)
     session_id: Mapped[str] = mapped_column(String(120), index=True)
     goal: Mapped[str] = mapped_column(Text)
@@ -70,6 +83,16 @@ class OrchestrationRecord(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class ExecutionAccessRecord(Base):
+    __tablename__ = "execution_access"
+    __table_args__ = (UniqueConstraint("orchestration_id", "user_id", name="uq_execution_access_user"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    orchestration_id: Mapped[str] = mapped_column(String(80), index=True)
+    user_id: Mapped[str] = mapped_column(String(80), index=True)
+    access_level: Mapped[str] = mapped_column(String(30), default="viewer")
+
+
 class AuditRecord(Base):
     __tablename__ = "audit_records"
 
@@ -81,12 +104,13 @@ class AuditRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
-class SessionRecord(Base):
-    __tablename__ = "shared_sessions"
-    __table_args__ = (UniqueConstraint("tenant_id", "session_id", name="uq_shared_session_tenant_session"),)
+class UserSessionRecord(Base):
+    __tablename__ = "user_shared_sessions"
+    __table_args__ = (UniqueConstraint("tenant_id", "owner_user_id", "session_id", name="uq_user_shared_session"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     tenant_id: Mapped[str] = mapped_column(String(80), index=True)
+    owner_user_id: Mapped[str] = mapped_column(String(80), index=True)
     session_id: Mapped[str] = mapped_column(String(120), index=True)
     payload_json: Mapped[str] = mapped_column(Text, default="{}")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -122,26 +146,34 @@ class ApprovalRecord(Base):
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-class SkillRecord(Base):
-    __tablename__ = "skills"
-    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_skill_tenant_name"),)
+class CatalogWorkerRecord(Base):
+    __tablename__ = "catalog_workers"
+
+    worker_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    display_name: Mapped[str] = mapped_column(String(120))
+    description: Mapped[str] = mapped_column(Text)
+    runtime_name: Mapped[str] = mapped_column(String(80))
+    enabled: Mapped[bool] = mapped_column(default=True)
+    config_json: Mapped[str] = mapped_column(Text, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CatalogSkillRecord(Base):
+    __tablename__ = "catalog_skills"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tenant_id: Mapped[str] = mapped_column(String(80), index=True)
-    name: Mapped[str] = mapped_column(String(120))
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     source: Mapped[str] = mapped_column(String(30), default="inline")
     content: Mapped[str] = mapped_column(Text)
     description: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
-class McpServerRecord(Base):
-    __tablename__ = "mcp_servers"
-    __table_args__ = (UniqueConstraint("tenant_id", "name", name="uq_mcp_tenant_name"),)
+class CatalogMcpServerRecord(Base):
+    __tablename__ = "catalog_mcp_servers"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    tenant_id: Mapped[str] = mapped_column(String(80), index=True)
-    name: Mapped[str] = mapped_column(String(120))
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
     transport: Mapped[str] = mapped_column(String(40))
     url: Mapped[str] = mapped_column(Text, default="")
     command: Mapped[str] = mapped_column(Text, default="")

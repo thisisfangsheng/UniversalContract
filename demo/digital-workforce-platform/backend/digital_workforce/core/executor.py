@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import uuid
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -18,9 +18,9 @@ from common.contracts import LeaderPolicy, OrchestrationMode, OrchestrationPlan,
 from .presets import TEMPLATES
 
 
-def resolve_request(payload: dict[str, Any]) -> dict[str, Any]:
+def resolve_request(payload: dict[str, Any], template_snapshot: Mapping[str, Any] | None = None) -> dict[str, Any]:
     template_id = payload.get("template_id")
-    template = TEMPLATES.get(template_id) if template_id else None
+    template = template_snapshot if template_snapshot is not None else (TEMPLATES.get(template_id) if template_id else None)
     if template_id and template is None:
         raise ValueError(f"未知 template_id: {template_id}")
     source = template or {}

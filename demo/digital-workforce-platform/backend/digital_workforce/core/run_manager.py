@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -19,9 +19,10 @@ if str(UC_ROOT) not in sys.path:
 from common.contracts import OrchestrationMode, OrchestrationRequest, WorkerTask
 from orchestration import create_workflow
 
-from ..models import ApprovalRecord, AuditRecord, OrchestrationRecord
+from ..models import ApprovalRecord, AuditRecord, ExecutionAccessRecord, OrchestrationRecord, ProcessTemplateRecord
 from .event_bridge import EventBridge, EventedWorkerEndpoint
 from .executor import DeterministicLeader, DeterministicReflector, ResumePlanLeader, resolve_request, result_payload
+from .presets import TEMPLATES
 from .registry import WorkerRegistry
 
 
@@ -32,8 +33,9 @@ class WorkflowRunManager:
         self._events = events
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
-    async def create(self, payload: dict[str, Any], tenant_id: str) -> dict[str, str]:
-        effective = resolve_request(payload)
+    async def create(self, payload: dict[str, Any], tenant_id: str, owner_user_id: str) -> dict[str, str]:
+        template_snapshot, template_version = await self._template_snapshot(payload, tenant_id)
+        effective = resolve_request(payload, template_snapshot)
         continued_from = payload.get("continued_from")
         if continued_from:
             effective["continued_from"] = str(continued_from)
@@ -47,6 +49,10 @@ class WorkflowRunManager:
         record = OrchestrationRecord(
             orchestration_id=orchestration_id,
             tenant_id=tenant_id,
+            owner_user_id=owner_user_id,
+            template_id=payload.get("template_id"),
+            template_version=template_version,
+            template_snapshot_json=json.dumps(template_snapshot, ensure_ascii=False) if template_snapshot is not None else None,
             workflow_id=f"wf_{orchestration_id}",
             session_id=effective["session_id"],
             goal=effective["goal"],
@@ -61,10 +67,11 @@ class WorkflowRunManager:
         self._tasks[orchestration_id] = asyncio.create_task(self._run(orchestration_id))
         return {"orchestration_id": orchestration_id, "session_id": effective["session_id"], "status": "queued"}
 
-    async def continue_from(self, orchestration_id: str, payload: dict[str, Any], tenant_id: str) -> dict[str, str]:
+    async def continue_from(self, orchestration_id: str, payload: dict[str, Any], tenant_id: str, owner_user_id: str) -> dict[str, str]:
         async with self._sessions() as session:
             parent = await session.get(OrchestrationRecord, orchestration_id)
-            if parent is None or parent.tenant_id != tenant_id:
+            access_level = await self._access_level(session, parent, owner_user_id) if parent is not None else None
+            if parent is None or parent.tenant_id != tenant_id or access_level not in {"owner", "collaborator"}:
                 raise KeyError(orchestration_id)
             parent_effective = json.loads(parent.effective_json)
         continuation = {
@@ -75,9 +82,13 @@ class WorkflowRunManager:
             "facts": {**parent_effective.get("facts", {}), **dict(payload.get("facts") or {})},
             "context": payload.get("context") or [],
             "react": payload.get("react") or parent_effective.get("react", {}),
+            "_template_snapshot": json.loads(parent.template_snapshot_json) if parent.template_snapshot_json else None,
+            "_template_version": parent.template_version,
             "continued_from": orchestration_id,
         }
-        return await self.create(continuation, tenant_id)
+        if parent.template_snapshot_json:
+            continuation["template_id"] = parent.template_id
+        return await self.create(continuation, tenant_id, owner_user_id)
 
     async def _run(self, orchestration_id: str) -> None:
         async with self._sessions() as session:
@@ -89,7 +100,7 @@ class WorkflowRunManager:
             effective = json.loads(record.effective_json)
             tenant_id = record.tenant_id
         try:
-            endpoints = await self._registry.endpoints_for(effective["worker_ids"], tenant_id)
+            endpoints = await self._registry.endpoints_for(effective["worker_ids"], tenant_id, record.owner_user_id)
             endpoints = [EventedWorkerEndpoint(endpoint, self._events, tenant_id, orchestration_id) for endpoint in endpoints]
             request = OrchestrationRequest(record.workflow_id, record.session_id, record.goal, effective["facts"], OrchestrationMode(record.mode))
             leader = DeterministicLeader()
@@ -133,7 +144,7 @@ class WorkflowRunManager:
                 run_result = await workflow.run(request)
                 result = list(run_result.get_outputs())[-1]
             payload = result_payload(result)
-            provider = self._registry.session_provider_for(tenant_id)
+            provider = self._registry.session_provider_for(tenant_id, record.owner_user_id)
             shared_session = await provider.load(record.session_id)
             session_payload = {
                 "session_id": shared_session.session_id,
@@ -178,19 +189,20 @@ class WorkflowRunManager:
                     await session.commit()
                     await self._events.emit(tenant_id, orchestration_id, "failed", {"error": str(error)})
 
-    async def get(self, orchestration_id: str, tenant_id: str) -> dict[str, Any] | None:
+    async def get(self, orchestration_id: str, tenant_id: str, owner_user_id: str) -> dict[str, Any] | None:
         async with self._sessions() as session:
             record = await session.get(OrchestrationRecord, orchestration_id)
-            if record is None or record.tenant_id != tenant_id:
+            if record is None or record.tenant_id != tenant_id or not await self._access_level(session, record, owner_user_id):
                 return None
             return self._view(record)
 
-    async def list(self, tenant_id: str) -> list[dict[str, Any]]:
+    async def list(self, tenant_id: str, owner_user_id: str) -> list[dict[str, Any]]:
         async with self._sessions() as session:
-            records = (await session.scalars(select(OrchestrationRecord).where(OrchestrationRecord.tenant_id == tenant_id).order_by(OrchestrationRecord.created_at.desc()))).all()
+            granted = select(ExecutionAccessRecord.orchestration_id).where(ExecutionAccessRecord.user_id == owner_user_id)
+            records = (await session.scalars(select(OrchestrationRecord).where(OrchestrationRecord.tenant_id == tenant_id, or_(OrchestrationRecord.owner_user_id == owner_user_id, OrchestrationRecord.orchestration_id.in_(granted))).order_by(OrchestrationRecord.created_at.desc()))).all()
             return [self._view(record) for record in records]
 
-    async def approve(self, orchestration_id: str, task_id: str, decision: str, note: str, tenant_id: str) -> dict[str, Any]:
+    async def approve(self, orchestration_id: str, task_id: str, decision: str, note: str, tenant_id: str, owner_user_id: str) -> dict[str, Any]:
         if decision not in {"approve", "reject"}:
             raise ValueError("decision 必须为 approve 或 reject")
         async with self._sessions() as session:
@@ -200,7 +212,8 @@ class WorkflowRunManager:
                 ApprovalRecord.task_id == task_id,
             ))
             record = await session.get(OrchestrationRecord, orchestration_id)
-            if approval is None or record is None:
+            access_level = await self._access_level(session, record, owner_user_id) if record is not None else None
+            if approval is None or record is None or access_level not in {"owner", "approver", "collaborator"}:
                 raise KeyError(task_id)
             if approval.status != "pending":
                 raise RuntimeError("审批已处理，禁止重复投递")
@@ -223,13 +236,13 @@ class WorkflowRunManager:
             stored = json.loads(approval.task_json)
         source = stored["task"]
         task = WorkerTask(source["task_id"], source["worker_id"], source["instruction"], source["input"], source["idempotency_key"], tuple(source.get("depends_on", ())), resume={"approved": decision == "approve", "note": note})
-        endpoints = await self._registry.endpoints_for([task.worker_id], tenant_id)
+        endpoints = await self._registry.endpoints_for([task.worker_id], tenant_id, record.owner_user_id)
         resumed_endpoint = EventedWorkerEndpoint(endpoints[0], self._events, tenant_id, orchestration_id)
         receipt = await resumed_endpoint.execute(task, record.session_id)
         successor_ids = stored["worker_ids"][stored["worker_ids"].index(task.worker_id) + 1:]
         successor_receipts = []
         if decision == "approve" and successor_ids:
-            successors = await self._registry.endpoints_for(successor_ids, tenant_id)
+            successors = await self._registry.endpoints_for(successor_ids, tenant_id, record.owner_user_id)
             evented = [EventedWorkerEndpoint(endpoint, self._events, tenant_id, orchestration_id) for endpoint in successors]
             resume_request = OrchestrationRequest(f"{record.workflow_id}:resume1", record.session_id, record.goal, {**stored["facts"], "resume_receipt": dict(receipt.output)}, OrchestrationMode.SEQUENTIAL)
             resume_tasks = tuple(WorkerTask(
@@ -252,10 +265,10 @@ class WorkflowRunManager:
                 await session.commit()
         await self._events.emit(tenant_id, orchestration_id, "aggregate", {"result": result})
 
-    async def cancel(self, orchestration_id: str, tenant_id: str) -> bool:
+    async def cancel(self, orchestration_id: str, tenant_id: str, owner_user_id: str) -> bool:
         async with self._sessions() as session:
             record = await session.get(OrchestrationRecord, orchestration_id)
-            if record is None or record.tenant_id != tenant_id:
+            if record is None or record.tenant_id != tenant_id or record.owner_user_id != owner_user_id:
                 return False
             record.status = "cancelled"
             task = self._tasks.get(orchestration_id)
@@ -264,6 +277,40 @@ class WorkflowRunManager:
             await session.commit()
             await self._events.emit(tenant_id, orchestration_id, "failed", {"status": "cancelled"})
             return True
+
+    async def grant_access(self, orchestration_id: str, tenant_id: str, owner_user_id: str, user_id: str, access_level: str) -> None:
+        if access_level not in {"viewer", "approver", "collaborator"}:
+            raise ValueError("access_level 仅支持 viewer、approver 或 collaborator")
+        async with self._sessions() as session:
+            record = await session.get(OrchestrationRecord, orchestration_id)
+            if record is None or record.tenant_id != tenant_id or record.owner_user_id != owner_user_id:
+                raise KeyError(orchestration_id)
+            existing = await session.scalar(select(ExecutionAccessRecord).where(ExecutionAccessRecord.orchestration_id == orchestration_id, ExecutionAccessRecord.user_id == user_id))
+            if existing is None:
+                session.add(ExecutionAccessRecord(orchestration_id=orchestration_id, user_id=user_id, access_level=access_level))
+            else:
+                existing.access_level = access_level
+            await session.commit()
+
+    async def _template_snapshot(self, payload: dict[str, Any], tenant_id: str) -> tuple[dict[str, Any] | None, int | None]:
+        provided = payload.get("_template_snapshot")
+        if provided is not None:
+            return dict(provided), payload.get("_template_version")
+        template_id = payload.get("template_id")
+        if not template_id or template_id in TEMPLATES:
+            return None, None
+        async with self._sessions() as session:
+            record = await session.get(ProcessTemplateRecord, template_id)
+        if record is None or record.tenant_id != tenant_id or record.status != "published":
+            raise ValueError("流程模板不存在或尚未发布")
+        return json.loads(record.definition_json), record.version
+
+    @staticmethod
+    async def _access_level(session: AsyncSession, record: OrchestrationRecord, user_id: str) -> str | None:
+        if record.owner_user_id == user_id:
+            return "owner"
+        grant = await session.scalar(select(ExecutionAccessRecord).where(ExecutionAccessRecord.orchestration_id == record.orchestration_id, ExecutionAccessRecord.user_id == user_id))
+        return grant.access_level if grant is not None else None
 
     @staticmethod
     def _task_payload(task: WorkerTask) -> dict[str, Any]:
@@ -281,6 +328,8 @@ class WorkflowRunManager:
             "session_id": record.session_id,
             "goal": record.goal,
             "mode": record.mode,
+            "template_id": record.template_id,
+            "template_version": record.template_version,
             "status": record.status,
             "effective": json.loads(record.effective_json),
             "continued_from": json.loads(record.effective_json).get("continued_from"),

@@ -20,7 +20,6 @@ from sqlalchemy.exc import IntegrityError
 from common.contracts import AuthMode, McpServerSpec, McpTransport, PrincipalContext
 from common.security import AuthenticationError, AuthorizationError
 from .config import Settings, load_settings
-from .core.presets import TEMPLATES
 from .core.event_bridge import EventBridge
 from .core.registry import WorkerRegistry
 from .core.run_manager import WorkflowRunManager
@@ -28,7 +27,7 @@ from common.skills import parse_skill_markdown
 from .database import make_session_factory
 from .auth import InMemoryTokenRevocation, JwtTokenService
 from .identity import SqlAlchemyUserDirectory
-from .models import Base, McpServerRecord, MembershipRecord, SkillRecord, TenantRecord, UserRecord, WorkerRecord
+from .models import Base, CatalogMcpServerRecord, CatalogSkillRecord, CatalogWorkerRecord, MembershipRecord, ProcessTemplateRecord, TenantContextRecord, TenantRecord, UserRecord
 
 
 class OrchestrationInput(BaseModel):
@@ -97,6 +96,25 @@ class MembershipInput(BaseModel):
     role: str = "member"
 
 
+class TenantContextInput(BaseModel):
+    system_prompt: str = Field(max_length=4000)
+
+
+class ProcessTemplateInput(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    description: str = ""
+    status: str = "draft"
+    mode: str = "sequential"
+    worker_ids: list[str] = Field(default_factory=list)
+    facts: dict[str, Any] = Field(default_factory=dict)
+    react: dict[str, Any] = Field(default_factory=dict)
+
+
+class ExecutionAccessInput(BaseModel):
+    username: str
+    access_level: str = "viewer"
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or load_settings()
     if settings.auth_profile not in {"local", "token"}:
@@ -124,11 +142,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.identities = identities
     app.state.token_service = token_service
 
-    def tenant(request: Request) -> str:
+    def principal(request: Request) -> PrincipalContext:
         principal = getattr(request.state, "principal", None)
         if principal is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing authenticated principal")
-        return principal.tenant_id
+        return principal
+
+    def tenant(request: Request) -> str:
+        return principal(request).tenant_id
 
     async def resolve_principal(request: Request) -> PrincipalContext:
         if settings.auth_profile == "local":
@@ -258,6 +279,104 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             await session.commit()
         return {"user_id": account.user_id, "tenant_id": tenant_id, "role": payload.role}
 
+    @app.get("/api/tenant-context")
+    async def tenant_context(request: Request) -> dict[str, str]:
+        tenant_id = tenant(request)
+        async with session_factory() as session:
+            context = await session.get(TenantContextRecord, tenant_id)
+        return {"tenant_id": tenant_id, "system_prompt": context.system_prompt if context else ""}
+
+    @app.put("/api/tenant-context")
+    async def update_tenant_context(payload: TenantContextInput, request: Request) -> dict[str, str]:
+        authenticated = principal(request)
+        if "owner" not in authenticated.roles:
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅租户 owner 可修改系统提示词")
+        async with session_factory() as session:
+            context = await session.get(TenantContextRecord, authenticated.tenant_id)
+            if context is None:
+                context = TenantContextRecord(tenant_id=authenticated.tenant_id, system_prompt=payload.system_prompt)
+                session.add(context)
+            else:
+                context.system_prompt = payload.system_prompt
+            await session.commit()
+        return {"tenant_id": authenticated.tenant_id, "system_prompt": payload.system_prompt}
+
+    def process_template_view(record: ProcessTemplateRecord) -> dict[str, Any]:
+        definition = json.loads(record.definition_json)
+        return {
+            "id": record.template_id,
+            "name": record.name,
+            "description": record.description,
+            "status": record.status,
+            "version": record.version,
+            "mode": definition["mode"],
+            "worker_ids": definition["worker_ids"],
+            "facts": definition.get("facts", {}),
+            "react": definition.get("react", {}),
+        }
+
+    async def validate_process_template(payload: ProcessTemplateInput, tenant_id: str) -> None:
+        if payload.status not in {"draft", "published"}:
+            raise HTTPException(status_code=422, detail="status 仅支持 draft 或 published")
+        if payload.mode not in {"sequential", "concurrent", "handoff", "react"}:
+            raise HTTPException(status_code=422, detail="不支持的编排模式")
+        if not payload.worker_ids:
+            raise HTTPException(status_code=422, detail="流程模板至少需要一个数字员工")
+        try:
+            for worker_id in payload.worker_ids:
+                await registry.get_worker(worker_id, tenant_id)
+        except KeyError as error:
+            raise HTTPException(status_code=422, detail=f"未知数字员工: {error.args[0]}") from error
+
+    @app.get("/api/process-templates")
+    async def process_templates(request: Request) -> list[dict[str, Any]]:
+        authenticated = principal(request)
+        async with session_factory() as session:
+            statement = select(ProcessTemplateRecord).where(ProcessTemplateRecord.tenant_id == authenticated.tenant_id)
+            if "owner" not in authenticated.roles:
+                statement = statement.where(ProcessTemplateRecord.status == "published")
+            records = (await session.scalars(statement.order_by(ProcessTemplateRecord.name))).all()
+        return [process_template_view(record) for record in records]
+
+    @app.post("/api/process-templates", status_code=201)
+    async def create_process_template(payload: ProcessTemplateInput, request: Request) -> dict[str, Any]:
+        authenticated = principal(request)
+        if "owner" not in authenticated.roles:
+            raise HTTPException(status_code=403, detail="仅租户 owner 可创建流程模板")
+        await validate_process_template(payload, authenticated.tenant_id)
+        record = ProcessTemplateRecord(
+            template_id=f"pt_{uuid.uuid4().hex}", tenant_id=authenticated.tenant_id,
+            name=payload.name, description=payload.description, status=payload.status,
+            definition_json=json.dumps({"mode": payload.mode, "worker_ids": payload.worker_ids, "facts": payload.facts, "react": payload.react}, ensure_ascii=False),
+            created_by_user_id=authenticated.subject,
+        )
+        async with session_factory() as session:
+            session.add(record)
+            try:
+                await session.commit()
+            except IntegrityError as error:
+                await session.rollback()
+                raise HTTPException(status_code=409, detail="该租户已存在同名流程模板") from error
+        return process_template_view(record)
+
+    @app.put("/api/process-templates/{template_id}")
+    async def update_process_template(template_id: str, payload: ProcessTemplateInput, request: Request) -> dict[str, Any]:
+        authenticated = principal(request)
+        if "owner" not in authenticated.roles:
+            raise HTTPException(status_code=403, detail="仅租户 owner 可修改流程模板")
+        await validate_process_template(payload, authenticated.tenant_id)
+        async with session_factory() as session:
+            record = await session.get(ProcessTemplateRecord, template_id)
+            if record is None or record.tenant_id != authenticated.tenant_id:
+                raise HTTPException(status_code=404, detail="流程模板不存在")
+            record.name = payload.name
+            record.description = payload.description
+            record.status = payload.status
+            record.version += 1
+            record.definition_json = json.dumps({"mode": payload.mode, "worker_ids": payload.worker_ids, "facts": payload.facts, "react": payload.react}, ensure_ascii=False)
+            await session.commit()
+        return process_template_view(record)
+
     @app.get("/api/workers")
     async def workers(request: Request) -> list[dict[str, Any]]:
         tenant_id = tenant(request)
@@ -313,39 +432,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/orchestrations/templates")
     async def templates(request: Request) -> list[dict[str, Any]]:
-        tenant(request)
-        return list(TEMPLATES.values())
+        return await process_templates(request)
 
-    def skill_view(record: SkillRecord) -> dict[str, Any]:
+    def skill_view(record: CatalogSkillRecord) -> dict[str, Any]:
         return {"name": record.name, "source": record.source, "content": record.content, "description": record.description}
 
     @app.get("/api/skills")
     async def skills(request: Request) -> list[dict[str, Any]]:
-        tenant_id = tenant(request)
+        tenant(request)
         async with session_factory() as session:
-            records = (await session.scalars(select(SkillRecord).where(SkillRecord.tenant_id == tenant_id).order_by(SkillRecord.name))).all()
+            records = (await session.scalars(select(CatalogSkillRecord).order_by(CatalogSkillRecord.name))).all()
             return [skill_view(record) for record in records]
 
     @app.post("/api/skills", status_code=201)
     async def create_skill(payload: SkillInput, request: Request) -> dict[str, Any]:
-        tenant_id = tenant(request)
+        tenant(request)
         document = parse_skill_markdown(payload.content, source=payload.source, default_name=payload.name)
         if not document.description:
             raise HTTPException(422, "SKILL.md frontmatter 必须提供 description")
         async with session_factory() as session:
-            existing = await session.scalar(select(SkillRecord).where(SkillRecord.tenant_id == tenant_id, SkillRecord.name == payload.name))
+            existing = await session.scalar(select(CatalogSkillRecord).where(CatalogSkillRecord.name == payload.name))
             if existing is not None:
                 raise HTTPException(409, "skill 已存在")
-            record = SkillRecord(tenant_id=tenant_id, name=payload.name, source=payload.source, content=payload.content, description=document.description)
+            record = CatalogSkillRecord(name=payload.name, source=payload.source, content=payload.content, description=document.description)
             session.add(record)
             await session.commit()
             return skill_view(record)
 
     @app.post("/api/skills/{name}/preview")
     async def preview_skill(name: str, request: Request) -> dict[str, Any]:
-        tenant_id = tenant(request)
+        tenant(request)
         async with session_factory() as session:
-            record = await session.scalar(select(SkillRecord).where(SkillRecord.tenant_id == tenant_id, SkillRecord.name == name))
+            record = await session.scalar(select(CatalogSkillRecord).where(CatalogSkillRecord.name == name))
             if record is None:
                 raise HTTPException(404, "skill not found")
         document = parse_skill_markdown(record.content, source=record.source, default_name=record.name)
@@ -353,42 +471,42 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/skills/{name}", status_code=204)
     async def delete_skill(name: str, request: Request) -> None:
-        tenant_id = tenant(request)
+        tenant(request)
         async with session_factory() as session:
-            record = await session.scalar(select(SkillRecord).where(SkillRecord.tenant_id == tenant_id, SkillRecord.name == name))
+            record = await session.scalar(select(CatalogSkillRecord).where(CatalogSkillRecord.name == name))
             if record is None:
                 raise HTTPException(404, "skill not found")
             await session.delete(record)
             await session.commit()
 
-    def mcp_view(record: McpServerRecord) -> dict[str, Any]:
+    def mcp_view(record: CatalogMcpServerRecord) -> dict[str, Any]:
         return {"name": record.name, "transport": record.transport, "url": record.url, "command": record.command, "args": json.loads(record.args_json), "allowed_tools": json.loads(record.allowed_tools_json), "blocked_tools": json.loads(record.blocked_tools_json)}
 
     @app.get("/api/mcp-servers")
     async def mcp_servers(request: Request) -> list[dict[str, Any]]:
-        tenant_id = tenant(request)
+        tenant(request)
         async with session_factory() as session:
-            records = (await session.scalars(select(McpServerRecord).where(McpServerRecord.tenant_id == tenant_id).order_by(McpServerRecord.name))).all()
+            records = (await session.scalars(select(CatalogMcpServerRecord).order_by(CatalogMcpServerRecord.name))).all()
             return [mcp_view(record) for record in records]
 
     @app.post("/api/mcp-servers", status_code=201)
     async def create_mcp_server(payload: McpServerInput, request: Request) -> dict[str, Any]:
-        tenant_id = tenant(request)
+        tenant(request)
         if payload.transport not in {"streamable_http", "stdio", "websocket"}:
             raise HTTPException(422, "不支持的 MCP transport")
         if payload.transport == "streamable_http" and not payload.url:
             raise HTTPException(422, "STREAMABLE_HTTP MCP server 需要 url")
         async with session_factory() as session:
-            if await session.scalar(select(McpServerRecord).where(McpServerRecord.tenant_id == tenant_id, McpServerRecord.name == payload.name)):
+            if await session.scalar(select(CatalogMcpServerRecord).where(CatalogMcpServerRecord.name == payload.name)):
                 raise HTTPException(409, "MCP server 已存在")
-            record = McpServerRecord(tenant_id=tenant_id, name=payload.name, transport=payload.transport, url=payload.url, command=payload.command, args_json=json.dumps(payload.args), allowed_tools_json=json.dumps(payload.allowed_tools), blocked_tools_json=json.dumps(payload.blocked_tools))
+            record = CatalogMcpServerRecord(name=payload.name, transport=payload.transport, url=payload.url, command=payload.command, args_json=json.dumps(payload.args), allowed_tools_json=json.dumps(payload.allowed_tools), blocked_tools_json=json.dumps(payload.blocked_tools))
             session.add(record)
             await session.commit()
             return mcp_view(record)
 
     @app.put("/api/mcp-servers/{name}")
     async def update_mcp_server(name: str, payload: McpServerInput, request: Request) -> dict[str, Any]:
-        tenant_id = tenant(request)
+        tenant(request)
         if payload.name != name:
             raise HTTPException(422, "MCP Server 名称创建后不可修改")
         if payload.transport not in {"streamable_http", "stdio", "websocket"}:
@@ -396,7 +514,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if payload.transport == "streamable_http" and not payload.url:
             raise HTTPException(422, "STREAMABLE_HTTP MCP server 需要 url")
         async with session_factory() as session:
-            record = await session.scalar(select(McpServerRecord).where(McpServerRecord.tenant_id == tenant_id, McpServerRecord.name == name))
+            record = await session.scalar(select(CatalogMcpServerRecord).where(CatalogMcpServerRecord.name == name))
             if record is None:
                 raise HTTPException(404, "MCP server not found")
             record.transport = payload.transport
@@ -410,13 +528,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.delete("/api/mcp-servers/{name}", status_code=204)
     async def delete_mcp_server(name: str, request: Request) -> None:
-        tenant_id = tenant(request)
+        tenant(request)
         async with session_factory() as session:
-            records = (await session.scalars(select(WorkerRecord).where(WorkerRecord.tenant_id == tenant_id))).all()
+            records = (await session.scalars(select(CatalogWorkerRecord))).all()
             bound_workers = [record.worker_id for record in records if name in json.loads(record.config_json).get("mcp_server_names", [])]
             if bound_workers:
                 raise HTTPException(409, f"MCP Server 仍被员工绑定: {', '.join(bound_workers)}；请先编辑员工解除绑定")
-            record = await session.scalar(select(McpServerRecord).where(McpServerRecord.tenant_id == tenant_id, McpServerRecord.name == name))
+            record = await session.scalar(select(CatalogMcpServerRecord).where(CatalogMcpServerRecord.name == name))
             if record is None:
                 raise HTTPException(404, "MCP server not found")
             await session.delete(record)
@@ -424,9 +542,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/mcp-servers/{name}/probe")
     async def probe_mcp_server(name: str, request: Request) -> dict[str, Any]:
-        tenant_id = tenant(request)
+        tenant(request)
         async with session_factory() as session:
-            record = await session.scalar(select(McpServerRecord).where(McpServerRecord.tenant_id == tenant_id, McpServerRecord.name == name))
+            record = await session.scalar(select(CatalogMcpServerRecord).where(CatalogMcpServerRecord.name == name))
             if record is None:
                 raise HTTPException(404, "MCP server not found")
             if record.transport != "streamable_http":
@@ -440,16 +558,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/orchestrations", status_code=201)
     async def create_orchestration(payload: OrchestrationInput, request: Request) -> dict[str, str]:
-        tenant_id = tenant(request)
+        authenticated = principal(request)
         try:
-            return await manager.create(payload.model_dump(), tenant_id)
+            return await manager.create(payload.model_dump(), authenticated.tenant_id, authenticated.subject)
         except (KeyError, ValueError) as error:
             raise HTTPException(422, str(error)) from error
 
     @app.post("/api/orchestrations/{orchestration_id}/continue", status_code=201)
     async def continue_orchestration(orchestration_id: str, payload: OrchestrationInput, request: Request) -> dict[str, str]:
+        authenticated = principal(request)
         try:
-            return await manager.continue_from(orchestration_id, payload.model_dump(), tenant(request))
+            return await manager.continue_from(orchestration_id, payload.model_dump(), authenticated.tenant_id, authenticated.subject)
         except KeyError as error:
             raise HTTPException(404, "orchestration not found") from error
         except ValueError as error:
@@ -457,11 +576,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/orchestrations")
     async def orchestrations(request: Request) -> list[dict[str, Any]]:
-        return await manager.list(tenant(request))
+        authenticated = principal(request)
+        return await manager.list(authenticated.tenant_id, authenticated.subject)
 
     @app.get("/api/orchestrations/export")
     async def export_orchestrations(request: Request) -> Response:
-        records = await manager.list(tenant(request))
+        authenticated = principal(request)
+        records = await manager.list(authenticated.tenant_id, authenticated.subject)
         buffer = io.StringIO()
         writer = csv.writer(buffer)
         writer.writerow(["orchestration_id", "goal", "mode", "status", "session_id", "created_at"])
@@ -471,22 +592,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/orchestrations/{orchestration_id}")
     async def orchestration(orchestration_id: str, request: Request) -> dict[str, Any]:
-        item = await manager.get(orchestration_id, tenant(request))
+        authenticated = principal(request)
+        item = await manager.get(orchestration_id, authenticated.tenant_id, authenticated.subject)
         if item is None:
             raise HTTPException(404, "orchestration not found")
         return item
 
     @app.get("/api/orchestrations/{orchestration_id}/session")
     async def orchestration_session(orchestration_id: str, request: Request) -> dict[str, Any]:
-        item = await manager.get(orchestration_id, tenant(request))
+        authenticated = principal(request)
+        item = await manager.get(orchestration_id, authenticated.tenant_id, authenticated.subject)
         if item is None:
             raise HTTPException(404, "orchestration not found")
         return item["session"] or {"session_id": item["session_id"], "facts": {}, "messages": []}
 
     @app.get("/api/orchestrations/{orchestration_id}/events")
     async def orchestration_events(orchestration_id: str, request: Request):
-        tenant_id = tenant(request)
-        if await manager.get(orchestration_id, tenant_id) is None:
+        authenticated = principal(request)
+        tenant_id = authenticated.tenant_id
+        if await manager.get(orchestration_id, tenant_id, authenticated.subject) is None:
             raise HTTPException(404, "orchestration not found")
         try:
             after = int(request.headers.get("Last-Event-ID", "0"))
@@ -499,10 +623,27 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
         return StreamingResponse(event_stream(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+    @app.post("/api/orchestrations/{orchestration_id}/access", status_code=201)
+    async def grant_orchestration_access(orchestration_id: str, payload: ExecutionAccessInput, request: Request) -> dict[str, str]:
+        authenticated = principal(request)
+        async with session_factory() as session:
+            user = await session.scalar(select(UserRecord).where(UserRecord.username == payload.username))
+            membership = None if user is None else await session.scalar(select(MembershipRecord).where(MembershipRecord.tenant_id == authenticated.tenant_id, MembershipRecord.user_id == user.user_id))
+        if membership is None:
+            raise HTTPException(status_code=422, detail="授权用户不是当前租户成员")
+        try:
+            await manager.grant_access(orchestration_id, authenticated.tenant_id, authenticated.subject, user.user_id, payload.access_level)
+        except KeyError as error:
+            raise HTTPException(status_code=404, detail="orchestration not found") from error
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        return {"orchestration_id": orchestration_id, "username": payload.username, "access_level": payload.access_level}
+
     @app.post("/api/orchestrations/{orchestration_id}/approvals/{task_id}")
     async def approve(orchestration_id: str, task_id: str, payload: ApprovalInput, request: Request) -> dict[str, Any]:
+        authenticated = principal(request)
         try:
-            return await manager.approve(orchestration_id, task_id, payload.decision, payload.note, tenant(request))
+            return await manager.approve(orchestration_id, task_id, payload.decision, payload.note, authenticated.tenant_id, authenticated.subject)
         except KeyError as error:
             raise HTTPException(404, "pending approval not found") from error
         except RuntimeError as error:
@@ -512,7 +653,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/orchestrations/{orchestration_id}/cancel")
     async def cancel(orchestration_id: str, request: Request) -> dict[str, str]:
-        if not await manager.cancel(orchestration_id, tenant(request)):
+        authenticated = principal(request)
+        if not await manager.cancel(orchestration_id, authenticated.tenant_id, authenticated.subject):
             raise HTTPException(404, "orchestration not found")
         return {"status": "cancelled"}
 
