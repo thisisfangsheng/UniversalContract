@@ -141,6 +141,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.events = events
     app.state.identities = identities
     app.state.token_service = token_service
+    access_cookie_name = "digital_workforce_access"
 
     def principal(request: Request) -> PrincipalContext:
         principal = getattr(request.state, "principal", None)
@@ -157,6 +158,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         authorization = request.headers.get("authorization", "")
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
+            token = request.cookies.get(access_cookie_name, "")
+        if not token:
             raise AuthenticationError("缺少 Bearer token")
         assert token_service is not None
         authenticated = await token_service.verify(token)
@@ -179,6 +182,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "tenant_id": principal.tenant_id,
         }
 
+    def set_access_cookie(response: Response, tokens: dict[str, str | int]) -> None:
+        response.set_cookie(
+            key=access_cookie_name,
+            value=str(tokens["access_token"]),
+            max_age=settings.access_token_ttl_s,
+            httponly=True,
+            samesite="lax",
+        )
+
     @app.middleware("http")
     async def authenticate_api_requests(request: Request, call_next):
         if request.url.path.startswith("/api/") and not request.url.path.startswith("/api/auth/") and request.url.path != "/api/health":
@@ -195,7 +207,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @app.post("/api/auth/register", status_code=201)
-    async def register(payload: RegistrationInput) -> dict[str, Any]:
+    async def register(payload: RegistrationInput, response: Response) -> dict[str, Any]:
         if settings.auth_profile != "token":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local profile 不提供注册")
         async with session_factory() as session:
@@ -216,10 +228,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await session.rollback()
                 raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="用户或租户已存在") from error
         principal = PrincipalContext(account.user_id, payload.tenant_id, frozenset({"owner"}), auth_mode=AuthMode.BEARER)
-        return {"user": {"user_id": account.user_id, "username": account.username, "display_name": account.display_name}, "tenant_id": payload.tenant_id, **await token_pair(principal)}
+        tokens = await token_pair(principal)
+        set_access_cookie(response, tokens)
+        return {"user": {"user_id": account.user_id, "username": account.username, "display_name": account.display_name}, "tenant_id": payload.tenant_id, **tokens}
 
     @app.post("/api/auth/login")
-    async def login(payload: LoginInput) -> dict[str, str | int]:
+    async def login(payload: LoginInput, response: Response) -> dict[str, str | int]:
         if settings.auth_profile != "token":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local profile 不提供登录")
         account = await identities.verify(payload.username, payload.password)
@@ -230,10 +244,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         membership = await identities.resolve_membership(account.user_id, tenant_id)
         if membership is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户不属于请求的租户")
-        return await token_pair(PrincipalContext(account.user_id, tenant_id, frozenset({membership.role}), auth_mode=AuthMode.BEARER))
+        tokens = await token_pair(PrincipalContext(account.user_id, tenant_id, frozenset({membership.role}), auth_mode=AuthMode.BEARER))
+        set_access_cookie(response, tokens)
+        return tokens
 
     @app.post("/api/auth/refresh")
-    async def refresh(payload: RefreshInput) -> dict[str, str | int]:
+    async def refresh(payload: RefreshInput, response: Response) -> dict[str, str | int]:
         if token_service is None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="local profile 不提供刷新")
         try:
@@ -244,17 +260,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         if membership is None:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="用户不属于 token 租户")
         await revocation.revoke(payload.refresh_token)
-        return await token_pair(PrincipalContext(principal.subject, membership.tenant_id, frozenset({membership.role}), auth_mode=AuthMode.BEARER))
+        tokens = await token_pair(PrincipalContext(principal.subject, membership.tenant_id, frozenset({membership.role}), auth_mode=AuthMode.BEARER))
+        set_access_cookie(response, tokens)
+        return tokens
 
     @app.post("/api/auth/logout", status_code=204)
-    async def logout(request: Request) -> None:
+    async def logout(request: Request, response: Response) -> None:
         if token_service is None:
             return None
         authorization = request.headers.get("authorization", "")
         scheme, _, token = authorization.partition(" ")
         if scheme.lower() != "bearer" or not token:
+            token = request.cookies.get(access_cookie_name, "")
+        if not token:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="缺少 Bearer token", headers={"WWW-Authenticate": "Bearer"})
         await revocation.revoke(token)
+        response.delete_cookie(access_cookie_name)
 
     @app.get("/api/auth/me")
     async def me(request: Request) -> dict[str, Any]:

@@ -162,6 +162,8 @@ async def run_auth_tests() -> None:
                 assert alice.status_code == 201, alice.text
                 alice_token = alice.json()["access_token"]
                 alice_headers = {"Authorization": f"Bearer {alice_token}"}
+                cookie_authenticated = await client.get("/api/auth/me")
+                assert cookie_authenticated.status_code == 200, cookie_authenticated.text
                 created = await client.post("/api/workers", headers=alice_headers, json={
                     "worker_id": "private-briefing", "name": "Private", "description": "Alice only",
                 })
