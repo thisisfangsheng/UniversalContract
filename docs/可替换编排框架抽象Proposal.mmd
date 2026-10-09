@@ -1,0 +1,20 @@
+flowchart TB
+    Public["中立公开编排契约<br/>OrchestrationRequest / Result"]
+    Public --> Facade["OrchestrationFacade<br/>统一生命周期"]
+    Facade --> Selector["RuntimeSelector<br/>按 capability 选择宿主"]
+    Selector --> MAF["MAF Runtime<br/>当前默认"]
+    Selector --> Future["Future Runtime<br/>LangGraph / ADK / 自研"]
+
+    Public --> Policies["策略插件<br/>Leader / Reflection / Manager"]
+    Policies --> Facade
+    Facade --> Workers["WorkerEndpoint<br/>A2A + Harness"]
+
+    MAF --> Workers
+    Future --> Workers
+
+    classDef public fill:#E7F0FF,stroke:#34699A,color:#12263A
+    classDef runtime fill:#EAF7EE,stroke:#41764B,color:#16351C
+    classDef boundary fill:#FFF4D6,stroke:#9B6C14,color:#432B00
+    class Public,Policies,Workers public
+    class MAF,Future runtime
+    class Facade,Selector boundary
